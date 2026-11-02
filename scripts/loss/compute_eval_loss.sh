@@ -6,10 +6,11 @@
 #SBATCH --cpus-per-task=9
 #SBATCH --time=01:00:00
 #SBATCH --array=6,7
-#SBATCH --output=/gpfs/home6/username/MasterThesis/outputs/eval_loss/slurm/eval_loss_%A_%a.out
+#SBATCH --output=outputs/eval_loss/slurm/eval_loss_%A_%a.out
 
 set -e
-REPO_ROOT="/gpfs/home6/username/MasterThesis"
+# Repo root, derived from this script's location (override by exporting REPO_ROOT).
+REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 OUTPUT_ROOT="${REPO_ROOT}/outputs/eval_loss"
 DATASET_CACHE_DIR="${REPO_ROOT}/data/hf_cache"
 TASK_ID="${SLURM_ARRAY_TASK_ID:-0}"
@@ -17,7 +18,8 @@ MODEL="llama3.1"  # "llama3.1" or "qwen2.5"
 LOSS_BATCH_SIZE=4
 MODEL_SOURCE="adapter"
 MERGE_MODE="standard_rescaled"
-PEFT_MODEL="${REPO_ROOT}/outputs/models/${MERGE_MODE}/${MODEL}/merged_model/merged_adapter"
+MERGED_MODELS_ROOT="${MERGED_MODELS_ROOT:-/scratch-shared/USERNAME/merged_models}"
+PEFT_MODEL="${MERGED_MODELS_ROOT}/${MERGE_MODE}/${MODEL}/merged_model/merged_adapter"
 RUN_NAME="${MERGE_MODE}"
 
 mkdir -p "${OUTPUT_ROOT}/slurm"

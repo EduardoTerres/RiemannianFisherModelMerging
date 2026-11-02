@@ -12,11 +12,11 @@ from tqdm import tqdm
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
-from src.dataset.dataset import DATASET_TEST, build_loader
+from src.dataset.dataset import DATASET_TEST as DATASET_TEST, build_loader
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Compute target-token eval loss on dataset tests.")
+    parser = argparse.ArgumentParser(description="Compute target-token eval loss on the task test splits.")
     parser.add_argument(
         "--model-source",
         "--eval-type",
@@ -42,10 +42,10 @@ def parse_args() -> argparse.Namespace:
 
 
 def resolve_args(args: argparse.Namespace) -> argparse.Namespace:
-    from src.paths import MODEL_FAMILIES_DATASET
+    from src.paths import MODEL_FAMILIES_BASE
 
     family_key = args.model_name or args.model
-    family = MODEL_FAMILIES_DATASET[family_key]
+    family = MODEL_FAMILIES_BASE[family_key]
     args.model_name = family.name
     args.model_path = args.model_path or Path(family.base_model_path)
     args.run_name = args.run_name or args.model_source
@@ -84,9 +84,9 @@ def load_model(args: argparse.Namespace):
 
 
 def adapter_path_for_task(args: argparse.Namespace, task: str) -> Path:
-    from src.paths import MODEL_FAMILIES_DATASET
+    from src.paths import MODEL_FAMILIES_BASE
 
-    family = MODEL_FAMILIES_DATASET[args.model_name]
+    family = MODEL_FAMILIES_BASE[args.model_name]
     task_names = [task_name for task_name, *_ in DATASET_TEST]
     task_id = task_names.index(task)
     return Path(family.adapter_paths[task_id])

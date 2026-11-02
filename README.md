@@ -1,93 +1,185 @@
-# Fisher-Weighted Riemannian Model Merging for Orthogonal Fine-Tuning
+# Fisher-Weighted Riemannian Model Merging for Orthogonal Finetuning
 
-Research code for fine-tuning, merging, and evaluating OFT adapters for causal
-language models. The main experiment path is:
+Code for the paper *Fisher-Weighted Riemannian Model Merging for Orthogonal Finetuning*.
+Experiments use *Llama 3.1 8B* and *Qwen 2.5 3B* on twelve generative tasks, with an
+*SDXL* study in the appendix.
 
-1. Fine-tune one OFT adapter per task.
-2. Optionally compute Fisher matrices for those adapters.
-3. Merge adapters with standard or Fisher-weighted Riemannian methods.
-4. Evaluate merged adapters with target-token loss or lm-eval.
+Released finetunes: https://anonymous-hf.com/a/rzhmxiutrwjg/
 
-## Layout
+Run every command from the repository root. The SLURM scripts target `gpu_a100` /
+`gpu_h100` partitions; adjust their `#SBATCH` headers for your cluster.
 
-- `src/merging.py`: core OFT/Riemannian merging methods.
-- `src/geometry.py`: manifold operations used by merging.
-- `src/dataset/dataset.py`: task list, prompt formatting, and dataloaders.
-- `src/finetune/finetune.py`: fine-tune task adapters.
-- `src/compute_fim.py`: compute Fisher matrices.
-- `src/scripts/perform_merging.py`: create merged adapters/models.
-- `src/loss/compute_eval_loss.py`: evaluate target-token loss.
-- `src/analysis/` and `src/plots/`: analysis and figures.
-- `scripts/`: SLURM wrappers for cluster runs.
+## 1. Install
 
-## Setup
+The scripts activate these environments by name.
 
 ```bash
-pip install -r requirements.txt
+# merge: finetuning, FIM, merging, analysis, plots
+conda create -n merge python=3.11 -y && conda activate merge
 pip install -e .
+
+# lm-eval: LLM evaluation
+conda create -n lm-eval python=3.11 -y && conda activate lm-eval
+pip install -e "OrthoMerge/eval/lm-evaluation-harness[hf,math,sentencepiece,unitxt]" \
+    -r OrthoMerge/requirements.txt "pyarrow<20" "setuptools<81" "tensorflow==2.18.1" \
+    bert-score nltk absl-py "git+https://github.com/google-research/bleurt.git"
+
+# orthofuse_env: SDXL appendix only
+conda env create -f OrthoFuse/environment.yml
 ```
 
-Model, adapter, and Fisher paths are configured in `src/paths.py`. By default the
-repo expects base models under `data/models/` and task adapters in folders named
-like:
+Plots need a TeX install with `type1cm`, `cm-super` and `dvipng`. Without one, set
+`text.usetex = False` in `src/analysis/plot_utils.py`.
 
-```text
-data/models/Llama-3.1-8B_OFT_dataset_adapters
-data/models/Qwen-2.5-3B_OFT_dataset_adapters
-```
-
-Update `FISHERS_DIR` in `src/paths.py` before running Fisher-based workflows.
-
-## Common Commands
-
-List tasks:
+## 2. Paths
 
 ```bash
-python -m src.finetune.finetune --list-tasks
+export REPO_ROOT=$(pwd)                       # sbatch runs a copy of each script, so it cannot locate the repo itself
+export MODELS_ROOT=/your/path/models          # base models + OFT adapters
+export FISHERS_ROOT=/your/path/fishers        # LLM diagonal FIMs
+export MERGED_MODELS_ROOT=/your/path/merged   # merged adapters
+
+# SDXL appendix only
+export SDXL_ROOT=/your/path/SDXL
+export SDXL_FISHER_ROOT=/your/path/sdxl_fim
+export HF_HOME=/your/path/hf-cache
+export DIFFUSION_OUTPUT_DIR=/your/path/diffusion-outputs   # optional
 ```
 
-Fine-tune one adapter:
+Defaults are in `src/paths.py` and `src/diffusion/dataset.py`. Outputs go to `outputs/`,
+datasets are cached in `data/hf_cache/`.
+
+SLURM does not create the `#SBATCH --output` directories, so create them once:
 
 ```bash
-python -m src.finetune.finetune --model-family llama3.1 --task coqa
+mkdir -p outputs/oft_neighborhood_certificate outputs/evaluation_subsets/slurm \
+    outputs/evaluation/{diagonal_fisher,standard_rescaled,baselines}/slurm \
+    outputs/{fim,finetunes,eval_loss}/slurm outputs/analysis/subsets outputs/diffusion/slurms
 ```
 
-Compute Fisher matrices:
+Expected layout:
+
+```
+$MODELS_ROOT/Llama-3.1-8B/
+$MODELS_ROOT/Llama-3.1-8B_OFT_adapters/llama3-1_8b_finetune_<task>/
+$MODELS_ROOT/Qwen-2.5-3B/
+$MODELS_ROOT/Qwen-2.5-3B_OFT_adapters/qwen2.5_3b_finetune_<task>/
+$FISHERS_ROOT/<llama3.1|qwen2.5>/<task>/<adapter_tag>_<finetuned|pretrained>.safetensors
+```
+
+`<task>` is one of: `coqa`, `nq_open`, `triviaqa`, `meddialog_qsumm`, `wmt16-en-de`,
+`wikitext`, `cnn_dailymail`, `xsum`, `babi`, `squadv2`, `mbpp`, `numinamath`.
+
+## 3. Models and data
+
+| What | How |
+|---|---|
+| Base LLMs | `python utils/download_weights.py` (Llama is gated: `huggingface-cli login` first) |
+| OFT finetunes | Download from https://anonymous-hf.com/a/rzhmxiutrwjg/ into `$MODELS_ROOT` |
+| LLM diagonal FIMs | Recompute (section 4) |
+| Task datasets | Downloaded automatically on first use |
+| SDXL backbone | Downloaded into `$HF_HOME`; run once with `HF_HUB_OFFLINE=0` |
+| SDXL GSOFT adapters + images | From the OrthoFuse release (see `OrthoFuse/README.md`) |
+
+SDXL assets go under `$SDXL_ROOT`:
+`concepts/adapters/pytorch_lora_weights_<concept>.safetensors`, `concepts/datasets/<concept>/`,
+`styles/adapters/pytorch_lora_weights_<style>.safetensors`, `styles/datasets/<image>`.
+
+## 4. Finetuning and FIMs
+
+Skip finetuning if you use the released adapters.
 
 ```bash
-python -m src.compute_fim --model-family llama3.1 --task-index 0
+conda activate merge
+sbatch scripts/finetune_parallel.sh   # array 0-11; set MODEL_FAMILY inside
+sbatch scripts/compute_fim.sh         # array 0-11; set MODEL_NAME inside
 ```
 
-Merge adapters:
+Hyperparameters are at the top of `src/finetune/finetune.py`. For both FIM anchors pass
+`--model-states finetuned pretrained` to `compute_fim.sh`.
+
+SDXL adapters are trained with `OrthoFuse/train.sh` and `OrthoFuse/train_style.sh`; their
+FIMs with `sbatch scripts/diffusion/compute_fim.sh` (array 0-17).
+
+## 5. Main paper
+
+### Figure 2: Convex normal neighborhood
 
 ```bash
-python -m src.scripts.perform_merging \
-  --model_family llama3.1 \
-  --merge_method gradients \
-  --merge_mode standard_rescaled \
-  --output_dir outputs/merged/llama3.1_standard_rescaled
+sbatch scripts/analysis/oft_neighborhood_certificate.sh
 ```
 
-Evaluate loss:
+Needs only the adapters. Output: `outputs/oft_neighborhood_certificate/combined_max_block_distance_mds.pdf`.
+
+### Table 1: Task addition
 
 ```bash
-python -m src.loss.compute_eval_loss \
-  --model llama3.1 \
-  --model-source adapter \
-  --peft-model outputs/merged/llama3.1_standard_rescaled/merged_adapter
+sbatch scripts/eval/pipe_finetunes.sh     # set MODEL_NAME inside
+sbatch scripts/eval/pipe_fishermerge.sh   # set MODEL_NAME + FISHER_SOURCE inside
+sbatch scripts/eval/pipe_orthomerge.sh    # MERGE_MODE=standard for the Lie sum
+sbatch scripts/eval/pipe_baselines.sh     # TIES, TSVM, Wudi (array 0-5)
+
+bash scripts/llm_table_results.sh --format latex
 ```
 
-Run tests:
+Run `pipe_fishermerge.sh` with `FISHER_SOURCE=finetuned` and `FISHER_SOURCE=pretrained`.
+Results go to `outputs/evaluation/<method>/<family>/<task>/`. The `METHODS` array in
+`llm_table_results.sh` must match the runs you did.
+
+### Figure 3: Number of merged tasks
 
 ```bash
-pytest
+python -m src.subsets.subsets_merge --phase merge \
+    --model-family llama3.1 --models-dir outputs/models/subsets/llama3.1
+sbatch scripts/subsets/subsets_pipe.sh
+sbatch scripts/subsets/subsets_plots.sh
 ```
 
-## Notes
+Output: `outputs/subsets/combined/subset_combined_only_included.pdf`.
 
-Most heavy workflows assume CUDA, Hugging Face access, and enough GPU memory for
-the selected model family. The SLURM scripts in `scripts/` are useful templates,
-but contain cluster-specific partitions and paths that may need editing.
+## 6. Appendix
 
-Generated models, adapters, Fisher tensors, caches, and evaluation outputs should
-stay out of git.
+### Tables 2 and 3: OFT adapter block structure
+
+```bash
+sbatch scripts/oft_info.sh                     # Table 2
+sbatch scripts/diffusion/oft_adapter_info.sh   # Table 3
+```
+
+### Table 4: FIM sizes
+
+```bash
+conda activate merge
+python -m src.info
+```
+
+### Figure 7: Per-dataset subset metrics
+
+Produced by `sbatch scripts/subsets/subsets_plots.sh`. Output:
+`outputs/subsets/<family>/subset_dataset_metrics_{llama,qwen}.pdf`.
+
+### Figures 8 and 9: Geodesic mode connectivity
+
+```bash
+sbatch scripts/analysis/loss_interpolation.sh
+```
+
+Output: `outputs/interpolation/<family>/imgs/loss_interpolation_{qwen,llama}_0_2.pdf`.
+
+### Figure 10: FIM differences and normalization
+
+```bash
+sbatch scripts/diffusion/analysis/normalize_fim_style_average.sh
+```
+
+Needs the SDXL FIMs. Output: `outputs/diffusion/analysis/fim/`.
+
+### Figures 11 and 14: Interpolation Pareto frontier and examples
+
+```bash
+sbatch scripts/diffusion/geodesic_interpolation.sh              # array 0-11 over styles
+sbatch scripts/diffusion/plots/plot_geodesic_interpolation.sh
+```
+
+Run the generation once per entry of the `METHODS` array in the first script. Figure 14
+uses montages from `samples_interpolation_geodesic/`.

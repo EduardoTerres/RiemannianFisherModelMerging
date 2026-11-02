@@ -5,28 +5,36 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=9
 #SBATCH --time=00:10:00
-#SBATCH --output=/home/username/MasterThesis/outputs/evaluation/standard_rescaled/slurm/pipe_orthomerge_%A.out
+#SBATCH --output=outputs/evaluation/standard_rescaled/slurm/pipe_orthomerge_%A.out
 
 set -e
 
 MODEL_NAME="llama3.1"
-MODEL_NAME="qwen2.5"
+# MODEL_NAME="qwen2.5"
 
 MERGE_METHOD="gradients"
-MERGE_MODE="standard"
-SCRIPT_DIR="/home/username/MasterThesis/scripts/eval"
-REPO_ROOT="/home/username/MasterThesis"
+MERGE_MODE="standard_rescaled"
+# Repo root, derived from this script's location (override by exporting REPO_ROOT).
+REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+MODELS_ROOT="${MODELS_ROOT:-/scratch-shared/USERNAME/models}"
+# Where merged adapters are written and read back (override by exporting it).
+MERGED_MODELS_ROOT="${MERGED_MODELS_ROOT:-/scratch-shared/USERNAME/merged_models}"
 
 if [[ "${MODEL_NAME}" == "llama3.1" ]]; then
-    BASE_MODEL_PATH="${REPO_ROOT}/data/models/Llama-3.1-8B"
+    BASE_MODEL_PATH="${MODELS_ROOT}/Llama-3.1-8B"
 elif [[ "${MODEL_NAME}" == "qwen2.5" ]]; then
-    BASE_MODEL_PATH="${REPO_ROOT}/data/models/Qwen-2.5-3B"
+    BASE_MODEL_PATH="${MODELS_ROOT}/Qwen-2.5-3B"
 else
     echo "Unknown model name: ${MODEL_NAME}"
     exit 1
 fi
 
-MODEL_DIR="${REPO_ROOT}/outputs/models/${MERGE_MODE}/${MODEL_NAME}/merged_model"
+if [[ ! -d "${BASE_MODEL_PATH}" ]]; then
+    echo "Base model path does not exist: ${BASE_MODEL_PATH}"
+    exit 1
+fi
+
+MODEL_DIR="${MERGED_MODELS_ROOT}/${MERGE_MODE}/${MODEL_NAME}/merged_model"
 MERGED_ADAPTER_PATH="${MODEL_DIR}/merged_adapter"
 EVAL_DIR="${REPO_ROOT}/outputs/evaluation/${MERGE_MODE}/${MODEL_NAME}"
 SLURM_DIR="${REPO_ROOT}/outputs/evaluation/${MERGE_MODE}/slurm"

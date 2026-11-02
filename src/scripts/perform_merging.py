@@ -10,12 +10,126 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 import torch
 import wandb
 from safetensors.torch import save_file
+from torch import Tensor
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel
 
-from src.merging import OFTMerging
+from src.merging import (
+    AdaMergingPP,
+    OFTKarcherMerging,
+    OFTMerging,
+    OrthoMergeCOFTMerging,
+    OrthoMergeCTIESOFTMerging,
+    OrthoMergeCTSVMOFTMerging,
+    WudiOFTMerging,
+)
 from src.utils import parse_device
-from src.paths import MODEL_FAMILIES_DATASET_FISHER_PRETRAINED as MODEL_FAMILIES, WANDB_PROJECT
+from src.paths import (
+    MODEL_FAMILIES_FISHER_FINETUNES,
+    MODEL_FAMILIES_FISHER_PRETRAINED,
+    MODEL_FAMILIES_FISHER_AVERAGE,
+    ModelFamily,
+    WANDB_PROJECT,
+)
+
+FISHER_SOURCES = {
+    "finetuned": MODEL_FAMILIES_FISHER_FINETUNES,
+    "pretrained": MODEL_FAMILIES_FISHER_PRETRAINED,
+    "average": MODEL_FAMILIES_FISHER_AVERAGE,
+}
+MODEL_FAMILIES = MODEL_FAMILIES_FISHER_FINETUNES
+from src.dataset.dataset import DATASET_TEST, build_loader
+
+DATASET_TEST = DATASET_TEST
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+def _build_alpha_optimizer_inputs(
+    model_family: ModelFamily,
+    device: str,
+    dataset_cache_dir: str | None,
+    num_samples: int = 128,
+    batch_size: int = 4,
+    max_length: int = 128,
+) -> tuple:
+    tokenizer = AutoTokenizer.from_pretrained(model_family.base_model_path)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    task_names = [tag for tag, *_ in DATASET_TEST]
+    task_loaders = [
+        build_loader(
+            dataset_path=ds_path,
+            dataset_name=ds_name,
+            split=split,
+            doc_to_text_fn=doc_to_text,
+            tokenizer=tokenizer,
+            num_samples=num_samples,
+            batch_size=batch_size,
+            max_length=max_length,
+            cache_dir=dataset_cache_dir,
+        )
+        for _, ds_path, ds_name, split, doc_to_text in DATASET_TEST
+    ]
+    peft_model = PeftModel.from_pretrained(
+        AutoModelForCausalLM.from_pretrained(
+            model_family.base_model_path, torch_dtype=torch.float32, device_map=None
+        ),
+        model_family.adapter_paths[0],
+        is_trainable=False,
+    )
+    peft_model.enable_adapter_layers()
+    peft_model.to(device)
+    return peft_model, task_loaders, task_names
+
+
+def _build_adamerging(
+    model_family: ModelFamily,
+    device: str,
+    dataset_cache_dir: str | None,
+    num_samples: int = 256,
+    batch_size: int = 16,
+    max_length: int = 32,
+) -> dict[str, Tensor]:
+    tokenizer = AutoTokenizer.from_pretrained(model_family.base_model_path)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    task_names = [tag for tag, *_ in DATASET_TEST]
+    task_loaders = [
+        build_loader(
+            dataset_path=ds_path,
+            dataset_name=ds_name,
+            split=split,
+            doc_to_text_fn=doc_to_text,
+            tokenizer=tokenizer,
+            num_samples=num_samples,
+            batch_size=batch_size,
+            max_length=max_length,
+            cache_dir=dataset_cache_dir,
+        )
+        for _, ds_path, ds_name, split, doc_to_text in DATASET_TEST
+    ]
+
+    base_model = AutoModelForCausalLM.from_pretrained(
+        model_family.base_model_path, torch_dtype=torch.float32, device_map=None
+    )
+    peft_model = PeftModel.from_pretrained(
+        base_model, model_family.adapter_paths[0], is_trainable=False
+    )
+    peft_model.enable_adapter_layers()
+    peft_model.to(device)
+    peft_model.eval()
+
+    wandb.init(project=WANDB_PROJECT, name=f"adamerging-{model_family.name}")
+
+    merging = AdaMergingPP(device=device)
+    merged_weights = merging.merge(
+        adapter_paths=model_family.adapter_paths,
+        model=peft_model,
+        task_loaders=task_loaders,
+        task_names=task_names,
+    )
+    return merged_weights
 
 
 def parse_args():
@@ -24,8 +138,18 @@ def parse_args():
         "--model_family", type=str, choices=list(MODEL_FAMILIES), required=True,
     )
     parser.add_argument(
-        "--merge_method", type=str, choices=["gradients"], default="gradients",
-        help="Merging method. Only gradient/OFT merging is supported.",
+        "--merge_method",
+        type=str,
+        choices=[
+            "gradients",
+            "wudi",
+            "karcher",
+            "adamerging",
+            "orthomerge_c",
+            "orthomerge_c_ties",
+            "orthomerge_c_tsvm",
+        ],
+        help="Merging method: gradients, wudi, karcher, adamerging, or OrthoMerge-C baselines.",  # noqa: E501
     )
     parser.add_argument(
         "--merge_mode",
@@ -52,6 +176,24 @@ def parse_args():
         help="Per-task weights (must match number of adapters). Defaults to uniform.",
     )
     parser.add_argument(
+        "--fisher_source",
+        choices=list(FISHER_SOURCES),
+        default="finetuned",
+        help="Which FIM to use per dataset: finetuned, pretrained, or their average.",
+    )
+    parser.add_argument(
+        "--fisher_backend",
+        choices=["diagonal", "kfac"],
+        default="diagonal",
+        help="Fisher approximation to use for Fisher merge modes.",
+    )
+    parser.add_argument(
+        "--fim_normalization",
+        choices=["none", "trace", "frobenius", "layer-trace", "layer-frobenius", "kl"],
+        default="none",
+        help="Normalization applied to the Fisher matrices before merging.",
+    )
+    parser.add_argument(
         "--output_dir", type=str, default="outputs/merged",
         help="Directory where the merged adapter and optionally the full model are saved.",
     )
@@ -63,36 +205,133 @@ def parse_args():
         "--device", type=str, default="cuda",
         help="Device to use (e.g., 'gpu', 'cpu').",
     )
+    parser.add_argument(
+        "--dataset-cache-dir",
+        type=Path,
+        default=REPO_ROOT / "data" / "hf_cache",
+        help="Hugging Face datasets cache used for AdaMerging calibration loaders.",
+    )
+    parser.add_argument(
+        "--optimize_alphas",
+        type=str,
+        choices=["adamerging", "adamergingpp", "adamerging_equal", "adamergingpp_equal"],
+        default=None,
+        help="If set, optimize alphas via entropy minimization; *_equal ties all alphas.",  # noqa: E501
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
     args.device = parse_device(args.device)
+    dataset_cache_dir = str(args.dataset_cache_dir) if args.dataset_cache_dir else None
 
-    model_family = MODEL_FAMILIES[args.model_family]
+    model_family = FISHER_SOURCES[args.fisher_source][args.model_family]
     base_model_path = model_family.base_model_path
     adapter_paths = model_family.adapter_paths
 
-    use_wandb = args.merge_mode not in {
-        "standard",
-        "standard_rescaled",
-        "diagonal_fisher",
-        "diagonal_fisher_std_rescaled",
-    }
+    # When averaging pretrained/finetuned Fishers under a normalization, don't use the
+    # raw pre-averaged (unnormalized) cache: normalize each source independently, sum,
+    # and normalize the sum again. This needs both sources kept separate through the merge.
+    fisher_paths_secondary = None
+    if args.fisher_source == "average" and args.fim_normalization != "none":
+        fisher_paths = model_family.fisher_finetuned_paths
+        fisher_paths_secondary = model_family.fisher_pretrained_paths
+    else:
+        fisher_paths = model_family.fisher_paths
+
+    def _to_kfac_paths(paths):
+        return [
+            path.replace("_oft_lie_fim.safetensors", "_oft_lie_kfac.safetensors")
+            if path.endswith("_oft_lie_fim.safetensors")
+            else path.replace("_fim.safetensors", "_kfac.safetensors")
+            for path in paths
+        ]
+
+    if args.fisher_backend == "kfac":
+        fisher_paths = _to_kfac_paths(fisher_paths)
+        if fisher_paths_secondary is not None:
+            fisher_paths_secondary = _to_kfac_paths(fisher_paths_secondary)
+
+    use_wandb = args.merge_method not in {
+        "orthomerge_c",
+        "orthomerge_c_ties",
+        "orthomerge_c_tsvm",
+    } and not (
+        args.merge_method == "gradients"
+        and args.merge_mode in {
+            "standard",
+            "standard_rescaled",
+            "diagonal_fisher",
+            "diagonal_fisher_std_rescaled",
+        }
+    )
     if use_wandb:
         wandb.init(
             project=WANDB_PROJECT,
             name=f"{args.merge_method}-{args.merge_mode}-{model_family.name}",
-            config=vars(args),
+            config={
+                key: str(value) if isinstance(value, Path) else value
+                for key, value in vars(args).items()
+            },
         )
 
-    merging = OFTMerging(lam=args.lam, alphas=args.alphas, device=args.device)
-    merged_weights = merging.merge(
-        adapter_paths=adapter_paths,
-        fisher_paths=model_family.fisher_paths if "fisher" in args.merge_mode else None,
-        mode=args.merge_mode,
-    )
+    merged_weights = None
+    if args.merge_method == "adamerging":
+        merged_weights = _build_adamerging(
+            model_family=model_family,
+            device=args.device,
+            dataset_cache_dir=dataset_cache_dir,
+        )
+    else:
+        if args.merge_method == "gradients":
+            merging = OFTMerging(
+                lam=args.lam,
+                alphas=args.alphas,
+                device=args.device,
+                fisher_backend=args.fisher_backend,
+                fim_normalization=args.fim_normalization,
+            )
+        elif args.merge_method == "wudi":
+            merging = WudiOFTMerging(device=args.device)
+        elif args.merge_method == "karcher":
+            merging = OFTKarcherMerging(lam=args.lam, alphas=args.alphas, device=args.device)
+        elif args.merge_method == "orthomerge_c":
+            merging = OrthoMergeCOFTMerging(lam=args.lam, alphas=args.alphas, device=args.device)
+        elif args.merge_method == "orthomerge_c_ties":
+            merging = OrthoMergeCTIESOFTMerging(
+                lam=args.lam,
+                alphas=args.alphas,
+                device=args.device,
+            )
+        elif args.merge_method == "orthomerge_c_tsvm":
+            merging = OrthoMergeCTSVMOFTMerging(
+                lam=args.lam,
+                alphas=args.alphas,
+                device=args.device,
+            )
+        else:
+            raise ValueError(f"Unsupported merge method: {args.merge_method}")
+
+        merge_kwargs: dict = dict(
+            adapter_paths=adapter_paths,
+            fisher_paths=fisher_paths if "fisher" in args.merge_mode else None,
+            mode=args.merge_mode,
+            optimize_alphas=args.optimize_alphas,
+        )
+        if args.merge_method == "gradients" and "fisher" in args.merge_mode:
+            merge_kwargs["fisher_paths_secondary"] = fisher_paths_secondary
+        if args.optimize_alphas is not None:
+            model, task_loaders, task_names = _build_alpha_optimizer_inputs(
+                model_family=model_family,
+                device=args.device,
+                dataset_cache_dir=dataset_cache_dir,
+            )
+            merge_kwargs["model"] = model
+            merge_kwargs["task_loaders"] = task_loaders
+            merge_kwargs["task_names"] = task_names
+
+        merged_weights = merging.merge(**merge_kwargs)
 
     if not merged_weights:
         print("Merging failed. No weights returned.")

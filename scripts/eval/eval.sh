@@ -4,14 +4,14 @@
 #SBATCH --job-name=eval
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=9
-#SBATCH --time=04:00:00
-#SBATCH --array=0-11%4
+#SBATCH --time=02:00:00
+#SBATCH --array=0-11
 #SBATCH --output=eval_model_%A_%a.out
 
 set -e
 
-SCRIPT_DIR="/home/username/MasterThesis/scripts/eval"
-REPO_ROOT="/home/username/MasterThesis"
+# Repo root, derived from this script's location (override by exporting REPO_ROOT).
+REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 MODEL_PATH="$1"
 OUTPUT_ROOT="$2"
 PEFT_MODEL="$3"
@@ -55,7 +55,6 @@ TASK_ID="${SLURM_ARRAY_TASK_ID}"
 
 TASK_NAME="${DATASETS[$TASK_ID]}"
 LM_EVAL_TASK="${LM_EVAL_TASKS[$TASK_ID]}"
-EVAL_BACKEND="${EVAL_BACKENDS[$TASK_ID]}"
 LM_EVAL_BATCH_SIZE=64
 LM_EVAL_LIMIT_ARGS=()
 
@@ -64,7 +63,7 @@ if [ "${TASK_NAME}" = "squadv2" ]; then
     LM_EVAL_BATCH_SIZE=1
 elif [ "${TASK_NAME}" = "wikitext" ] || [ "${TASK_NAME}" = "xsum" ]; then
     LM_EVAL_BATCH_SIZE=2
-elif [ "${TASK_NAME}" = "meddialog_qsumm" ] || [ "${TASK_NAME}" = "cnn_dailymail" ] || [ "${TASK_NAME}" = "gsm8k" ] || [ "${TASK_NAME}" = "babi" ] || [ "${TASK_NAME}" = "mbpp" ] || [ "${TASK_NAME}" = "math500" ]; then
+elif [ "${TASK_NAME}" = "meddialog_qsumm" ] || [ "${TASK_NAME}" = "cnn_dailymail" ] || [ "${TASK_NAME}" = "babi" ] || [ "${TASK_NAME}" = "mbpp" ] || [ "${TASK_NAME}" = "math500" ]; then
     LM_EVAL_BATCH_SIZE=4
 fi
 

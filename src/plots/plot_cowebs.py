@@ -68,8 +68,6 @@ def read_metric(model_dir: Path, task: str, metric: str) -> float | None:
         if value is not None:
             break
         value = values.get(alias)
-    if value is None and task == "humanevalplus":
-        value = values.get("pass@1") or values.get("pass_at_1")
     if not isinstance(value, int | float):
         return None
     return value
@@ -404,11 +402,22 @@ def plot_models(
                 handles,
                 labels,
                 loc="upper center",
-                bbox_to_anchor=(0.5, 0.98),
+                bbox_to_anchor=(0.49, 0.98),
                 ncol=1,
-                frameon=False,
+                frameon=True,
+                fancybox=False,
+                framealpha=0.78,
+                facecolor="white",
+                edgecolor="0.4",
+                handlelength=1.2,
+                borderpad=0.4,
                 prop={"weight": "bold", "size": 30},
             )
+            legend_handles = getattr(legend, "legend_handles", None)
+            if legend_handles is None:
+                legend_handles = legend.legendHandles
+            for handle in legend_handles:
+                handle.set_linewidth(6.0)
         else:
             legend = fig.legend(
                 handles,

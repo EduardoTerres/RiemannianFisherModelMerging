@@ -28,9 +28,10 @@ from transformers import (
 
 from src.dataset.dataset import DATASET_TRAIN, doc_to_text, expand_doc
 from src.paths import (
-    LLAMA_DATASET_ADAPTERS_FOLDER as LLAMA_ADAPTERS_FOLDER,
+    LLAMA_ADAPTERS_FOLDER as LLAMA_ADAPTERS_FOLDER,
     LLAMA_BASE_MODEL_PATH,
-    QWEN_DATASET_ADAPTERS_FOLDER as QWEN_ADAPTERS_FOLDER,
+    MODELS_DIR,
+    QWEN_ADAPTERS_FOLDER as QWEN_ADAPTERS_FOLDER,
     QWEN_BASE_MODEL_PATH,
     ROOTDIR,
 )
@@ -46,10 +47,10 @@ CACHE_DIR = ROOTDIR / "data" / "hf_cache"
 SCRATCH_CHECKPOINT_ROOT = Path(
     os.environ.get(
         "FINETUNE_CHECKPOINT_ROOT",
-        "/scratch-shared/username/MasterThesis/finetune_checkpoints",
+        "/scratch-shared/USERNAME/finetune_checkpoints",
     )
 )
-FINAL_OUTPUT_ROOT = ROOTDIR / "outputs" / "models"
+FINAL_OUTPUT_ROOT = MODELS_DIR
 SEED = 42
 MAX_LENGTH = 1024
 EVAL_FRACTION = 0.10
@@ -103,7 +104,7 @@ MODELS = {
         base_model_path=LLAMA_BASE_MODEL_PATH,
         adapters_folder=LLAMA_ADAPTERS_FOLDER,
         reference_adapter_name="llama3-1_8b_finetune_numinamath",  # copies OFT adapters format
-        output_dir_name="Llama-3.1-8B_OFT_dataset3_adapters",
+        output_dir_name="Llama-3.1-8B_OFT_adapters",
         output_prefix="llama3-1_8b",
     ),
     "qwen2.5": FinetuneModel(
@@ -111,7 +112,7 @@ MODELS = {
         base_model_path=QWEN_BASE_MODEL_PATH,
         adapters_folder=QWEN_ADAPTERS_FOLDER,
         reference_adapter_name="qwen2.5_3b_finetune_numinamath",  # copies OFT adapters format
-        output_dir_name="Qwen-2.5-3B_OFT_dataset3_adapters",
+        output_dir_name="Qwen-2.5-3B_OFT_adapters",
         output_prefix="qwen2.5_3b",
     ),
 }

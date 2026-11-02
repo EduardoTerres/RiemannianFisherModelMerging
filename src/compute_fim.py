@@ -14,7 +14,7 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel
 
-from src.paths import FISHERS_DIR as FIM_OUTPUT_ROOT, MODEL_FAMILIES_DATASET as MODEL_FAMILIES
+from src.paths import FISHERS_DIR as FIM_OUTPUT_ROOT, MODEL_FAMILIES_BASE as MODEL_FAMILIES, fisher_path
 from src.dataset.dataset import DATASET_TRAIN as TASKS, build_loader
 from src.utils import parse_device
 
@@ -26,6 +26,184 @@ WANDB_METRIC_MAX_ENTRIES = 200_000
 
 _merging = OFTMerging()
 _manifold = _merging.manifold
+
+
+def compute_fisher_pretrained(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    device: str,
+    metric_prefix: str | None = None,
+    wandb_step_offset: int = 0,
+) -> dict:
+    """
+    Compute the diagonal empirical Fisher: E[grad log p]^2.
+
+    Used for the pretrained model state: the OFT adapter weights are loaded
+    but zeroed out before this runs, so the gradient is taken with respect
+    to the base (pretrained) weights and no parallel transport is applied.
+
+    Args:
+        model:  an already-loaded, eval-mode CausalLM
+        loader: DataLoader yielding dicts with 'input_ids' and 'attention_mask'
+        device: torch device string
+
+    Returns:
+        dict mapping parameter name -> diagonal Fisher tensor (on CPU)
+    """
+    fisher = {}
+    for n, p in model.named_parameters():
+        if p.requires_grad:
+            fisher[n] = torch.zeros_like(p, device=device)
+
+    model.eval()
+    count = 0
+    previous_fishers = None
+
+    def log_convergence_metrics(num_batches: int) -> None:
+        nonlocal previous_fishers
+        if metric_prefix is None or num_batches % WANDB_LOG_EVERY_BATCH:
+            return
+        previous_fishers = log_fisher_convergence_metrics(
+            fisher=fisher,
+            normalizer=num_batches,
+            metric_prefix=metric_prefix,
+            previous_fishers=previous_fishers,
+            metric_step=wandb_step_offset + num_batches,
+        )
+
+    for batch in tqdm(loader, desc="Computing pretrained diagonal FIM"):
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        labels = batch["labels"].to(device)
+
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+        shift_logits = outputs.logits[:, :-1, :]
+        shift_labels = labels[:, 1:]
+        label_mask = (shift_labels != -100).float()
+
+        # Clamp -100 to 0 so nll_loss doesn't index out of bounds; masked out below
+        shift_labels_safe = shift_labels.clone()
+        shift_labels_safe[shift_labels == -100] = 0
+
+        log_probs = F.log_softmax(shift_logits, dim=-1)
+        token_nll = F.nll_loss(
+            log_probs.view(-1, log_probs.size(-1)),
+            shift_labels_safe.reshape(-1),
+            reduction="none",
+        ).view(shift_labels.shape)
+
+        loss = (token_nll * label_mask).sum() / label_mask.sum().clamp(min=1)
+
+        model.zero_grad()
+        loss.backward()
+
+        for n, p in model.named_parameters():
+            if p.requires_grad and p.grad is not None:
+                fisher[n] += p.grad.data ** 2
+
+        count += 1
+        log_convergence_metrics(count)
+
+    if count == 0:
+        raise ValueError("The DataLoader produced zero batches.")
+
+    for n in fisher:
+        fisher[n] /= count
+        fisher[n] = fisher[n].cpu()
+
+    return fisher
+
+
+def compute_fisher_finetuned(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    device: str,
+    metric_prefix: str | None = None,
+    wandb_step_offset: int = 0,
+) -> dict:
+    """
+    Compute the diagonal empirical Fisher: E[grad log p]^2.
+
+    Used for the finetuned model state: the OFT adapter weights are loaded
+    as-is (not zeroed). This intentionally mirrors `compute_fisher_pretrained`
+    exactly and does NOT parallel-transport the per-sample gradients before
+    squaring them -- it just backpropagates through whatever weights (base +
+    finetuned OFT adapter) are currently loaded on `model`.
+
+    Args:
+        model:  an already-loaded, eval-mode CausalLM with the finetuned OFT
+                adapter weights loaded
+        loader: DataLoader yielding dicts with 'input_ids' and 'attention_mask'
+        device: torch device string
+
+    Returns:
+        dict mapping parameter name -> diagonal Fisher tensor (on CPU)
+    """
+    fisher = {}
+    for n, p in model.named_parameters():
+        if p.requires_grad:
+            fisher[n] = torch.zeros_like(p, device=device)
+
+    model.eval()
+    count = 0
+    previous_fishers = None
+
+    def log_convergence_metrics(num_batches: int) -> None:
+        nonlocal previous_fishers
+        if metric_prefix is None or num_batches % WANDB_LOG_EVERY_BATCH:
+            return
+        previous_fishers = log_fisher_convergence_metrics(
+            fisher=fisher,
+            normalizer=num_batches,
+            metric_prefix=metric_prefix,
+            previous_fishers=previous_fishers,
+            metric_step=wandb_step_offset + num_batches,
+        )
+
+    for batch in tqdm(loader, desc="Computing finetuned diagonal FIM"):
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        labels = batch["labels"].to(device)
+
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+        shift_logits = outputs.logits[:, :-1, :]
+        shift_labels = labels[:, 1:]
+        label_mask = (shift_labels != -100).float()
+
+        # Clamp -100 to 0 so nll_loss doesn't index out of bounds; masked out below
+        shift_labels_safe = shift_labels.clone()
+        shift_labels_safe[shift_labels == -100] = 0
+
+        log_probs = F.log_softmax(shift_logits, dim=-1)
+        token_nll = F.nll_loss(
+            log_probs.view(-1, log_probs.size(-1)),
+            shift_labels_safe.reshape(-1),
+            reduction="none",
+        ).view(shift_labels.shape)
+
+        loss = (token_nll * label_mask).sum() / label_mask.sum().clamp(min=1)
+
+        model.zero_grad()
+        loss.backward()
+
+        for n, p in model.named_parameters():
+            if p.requires_grad and p.grad is not None:
+                fisher[n] += p.grad.data ** 2
+
+        count += 1
+        log_convergence_metrics(count)
+
+    if count == 0:
+        raise ValueError("The DataLoader produced zero batches.")
+
+    for n in fisher:
+        fisher[n] /= count
+        fisher[n] = fisher[n].cpu()
+
+    return fisher
+
+
+# ---- rest of fim attempts
 
 
 def log_fisher_convergence_metrics(
@@ -693,7 +871,7 @@ def compute_and_save_fim(
 
     metric_prefix = f"fim/{model_state}" if log_to_wandb else None
     if model_state == "pretrained":
-        fisher = compute_empirical_diagonal_fisher(
+        fisher = compute_fisher_pretrained(
             model,
             loader,
             device,
@@ -701,7 +879,7 @@ def compute_and_save_fim(
             wandb_step_offset=wandb_step_offset,
         )
     elif model_state == "finetuned":
-        fisher = compute_empirical_diagonal_transported_fisher(
+        fisher = compute_fisher_finetuned(
             model,
             loader,
             device,
@@ -730,6 +908,7 @@ def compute_task_fishers(
     debug: bool,
     log_to_wandb: bool,
     force_compute: bool,
+    model_states: tuple[str, ...] = ("pretrained", "finetuned"),
 ) -> None:
     task_tag, dataset_path, dataset_name, split, doc_to_text = TASKS[task_index]
     adapter_tag = os.path.basename(adapter_path.rstrip("/"))
@@ -740,10 +919,11 @@ def compute_task_fishers(
     print(f"Adapter model: {adapter_tag}", flush=True)
     print(f"Task index: {task_index}", flush=True)
     print(f"Debug: {debug}", flush=True)
+    print(f"Model states: {', '.join(model_states)}", flush=True)
 
     maybe_init_wandb(model_family, task_tag, adapter_tag, debug, log_to_wandb)
 
-    for model_state in ("pretrained", "finetuned"):
+    for model_state in model_states:
         save_path = Path(fisher_paths_by_state[model_state])
         save_path.parent.mkdir(parents=True, exist_ok=True)
         print(f"\nComputing {model_state} FIM", flush=True)
@@ -797,6 +977,24 @@ if __name__ == "__main__":
         "--device", type=str, default="cuda",
         help="Device to use for FIM computation (e.g., 'gpu', 'cpu').",
     )
+    parser.add_argument(
+        "--model-states",
+        nargs="+",
+        default=["pretrained", "finetuned"],
+        choices=["pretrained", "finetuned"],
+        help="Which model state(s) to compute the FIM for.",
+    )
+    parser.add_argument(
+        "--save-name",
+        type=str,
+        default=None,
+        help=(
+            "Name to use in place of the adapter directory's basename when "
+            "naming the saved FIM files, e.g. "
+            "<save-name>_pretrained.safetensors / <save-name>_finetuned.safetensors. "
+            "Defaults to the adapter's own tag."
+        ),
+    )
     args = parser.parse_args()
     args.device = parse_device(args.device)
     if args.debug:
@@ -807,10 +1005,18 @@ if __name__ == "__main__":
     model_family = MODEL_FAMILIES[args.model_family]
     base_model_path = model_family.base_model_path
     adapter_path = model_family.adapter_paths[args.task_index]
-    fisher_paths_by_state = {
-        "pretrained": model_family.fisher_pretrained_paths[args.task_index],
-        "finetuned": model_family.fisher_finetuned_paths[args.task_index],
-    }
+
+    if args.save_name:
+        task_tag = TASKS[args.task_index][0]
+        fisher_paths_by_state = {
+            "pretrained": fisher_path(args.model_family, task_tag, args.save_name, "pretrained"),
+            "finetuned": fisher_path(args.model_family, task_tag, args.save_name, "finetuned"),
+        }
+    else:
+        fisher_paths_by_state = {
+            "pretrained": model_family.fisher_pretrained_paths[args.task_index],
+            "finetuned": model_family.fisher_finetuned_paths[args.task_index],
+        }
 
     compute_task_fishers(
         base_model_path=base_model_path,
@@ -826,4 +1032,5 @@ if __name__ == "__main__":
         debug=args.debug,
         log_to_wandb=not args.no_wandb,
         force_compute=args.force_compute,
+        model_states=tuple(args.model_states),
     )

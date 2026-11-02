@@ -2,11 +2,22 @@ from __future__ import annotations
 
 import os
 from abc import ABC, abstractmethod
+from itertools import cycle
 from typing import Dict, List, Literal, Optional
 
 import torch
+import wandb
 from safetensors.torch import load_file
 from torch import Tensor
+from torch.func import functional_call
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+try:
+    import geoopt
+except ModuleNotFoundError:
+    geoopt = None
+import re
+from collections import defaultdict
 
 from src.geometry import Manifold, SOnManifold
 
@@ -21,7 +32,12 @@ MergeMode = Literal[
     "diagonal_fisher_std_rescaled",
     "diagonal_fisher_kl_rescaled",
     "fisher",
+    "fisher_rescaled",
+    "fisher_max_rescaled",
+    "fisher_std_rescaled",
+    "full_fisher",
 ]
+FisherBackend = Literal["diagonal", "kfac"]
 
 class RiemannianMerging(ABC):
     """
@@ -101,10 +117,25 @@ class OFTMerging(RiemannianMerging):
         lam: float = 0.0,
         alphas: Optional[List[float]] = None,
         device: str = "cpu",
+        fisher_backend: FisherBackend = "diagonal",
+        fim_normalization: str = "none",
     ):
         super().__init__(manifold=SOnManifold(), lam=lam, alphas=alphas)
         self.manifold: SOnManifold
         self.device = device
+        if fisher_backend not in {"diagonal", "kfac"}:
+            raise ValueError(f"Unsupported fisher_backend: {fisher_backend!r}")
+        self.fisher_backend = fisher_backend
+        if fim_normalization not in {
+            "none",
+            "trace",
+            "frobenius",
+            "layer-trace",
+            "layer-frobenius",
+            "kl",
+        }:
+            raise ValueError(f"Unsupported fim_normalization: {fim_normalization!r}")
+        self.fim_normalization = fim_normalization
 
     def oft_params_to_skew_matrix(
             self, oft_params: torch.Tensor, son_dimension: int,
@@ -195,22 +226,44 @@ class OFTMerging(RiemannianMerging):
                         fisher[new_key] = fisher.pop(key)
         return all_fishers
 
+    def _layer_fisher(self, fisher: Dict[str, Tensor], key: str) -> Tensor | Dict[str, Tensor]:
+        if self.fisher_backend == "diagonal":
+            return fisher[key]
+
+        required = {
+            "row": f"{key}.row",
+            "col": f"{key}.col",
+            "scale": f"{key}.scale",
+        }
+        missing = [name for name in required.values() if name not in fisher]
+        if missing:
+            raise KeyError(f"Missing KFAC tensors for {key}: {missing}")
+        out: Dict[str, Tensor] = {name: fisher[path] for name, path in required.items()}
+        trace_key = f"{key}.trace"
+        if trace_key in fisher:
+            out["trace"] = fisher[trace_key]
+        return out
+
     def merge_formula(
         self,
         weights_list: List[Tensor],
         fisher_list: Optional[List[Dict[str, Tensor]]] = None,
         mode: MergeMode = "standard",
         alphas: Optional[Tensor] = None,
+        fisher_list_secondary: Optional[List[Dict[str, Tensor]]] = None,
     ) -> Tensor:
         """Merge OFT task vectors using the specified mode.
 
         Args:
             weights_list: T tensors of shape (num_blocks, d), skew-symmetric so(n) parameters per task.
-            fisher_list: Per-task Fisher info — diagonal (num_blocks, d) for ``"diagonal_fisher"``,
-                full (num_blocks, d, d) for ``"fisher"``. Unused in ``"standard"`` mode.
-            mode: ``"standard"`` (alpha-weighted avg), ``"diagonal_fisher"``, or ``"fisher"``
-                (both Fisher modes transport to a common tangent space and solve a linear system).
+            fisher_list: Per-task Fisher info. ``"fisher"`` accepts diagonal, full, or KFAC
+                factors and uses ``self.fisher_backend`` plus tensor shape to choose the solve.
             alphas: Optional (T,) tensor overriding self.alphas. Kept differentiable when provided.
+            fisher_list_secondary: Optional second per-task Fisher source, same shape as
+                ``fisher_list`` (e.g. pretrained Fisher when ``fisher_list`` is finetuned).
+                When given and ``self.fim_normalization != "none"``, each task's Fisher is
+                normalized independently on both sources, summed, and normalized again --
+                see ``_normalize_and_combine_pair``.
 
         Returns:
             Merged OFT parameters of shape (num_blocks, d).
@@ -223,64 +276,103 @@ class OFTMerging(RiemannianMerging):
             alphas = self._resolve_alphas(T).to(self.device)
 
         if mode == "standard":
-            return self._standard_merging(weights_list, alphas)
+            return len(weights_list) * self._standard_merging(weights_list, alphas)
 
         if mode == "standard_rescaled":
             # assumes alpha_t = 1 and then applies orthomerge correction
             merged = self._standard_merging(weights_list, alphas)
             return self._orthomerge_rescale(weights_list, merged, alphas)
 
-        if mode == "diagonal_fisher":
+        if mode in {"fisher", "diagonal_fisher"}:
             if fisher_list is None:
                 raise ValueError(f"Fisher data is required for mode {mode!r}")
-            return self._diagonal_fisher_merging(weights_list, fisher_list, alphas)
+            if self._uses_full_fisher(weights_list, fisher_list):
+                return self._fisher_merging(
+                    weights_list, fisher_list, alphas, fisher_list_secondary,
+                )
+            return self._diagonal_fisher_merging(
+                weights_list, fisher_list, alphas, fisher_list_secondary,
+            )
 
         if mode == "diagonal_fisher_avg":
             if fisher_list is None:
                 raise ValueError(f"Fisher data is required for mode {mode!r}")
             avg_alphas = torch.full_like(alphas, 1.0 / len(weights_list))
+            if self.fisher_backend == "kfac":
+                return self._fisher_merging(
+                    weights_list, fisher_list, avg_alphas, fisher_list_secondary,
+                )
             return self._diagonal_fisher_merging(
                 weights_list,
                 fisher_list,
                 avg_alphas,
+                fisher_list_secondary,
             )
 
-        if mode == "diagonal_fisher_rescaled":
+        if mode in {"fisher_rescaled", "diagonal_fisher_rescaled"}:
             if fisher_list is None:
                 raise ValueError(f"Fisher data is required for mode {mode!r}")
-            merged = self._diagonal_fisher_merging(weights_list, fisher_list, alphas)
+            if self._uses_full_fisher(weights_list, fisher_list):
+                merged = self._fisher_merging(
+                    weights_list, fisher_list, alphas, fisher_list_secondary,
+                )
+                return self._full_fisher_norm_rescale(weights_list, fisher_list, merged, alphas)
+            merged = self._diagonal_fisher_merging(
+                weights_list, fisher_list, alphas, fisher_list_secondary,
+            )
             return self._fisher_norm_rescale(weights_list, fisher_list, merged, alphas)
 
-        if mode == "diagonal_fisher_max_rescaled":
+        if mode in {"fisher_max_rescaled", "diagonal_fisher_max_rescaled"}:
             if fisher_list is None:
                 raise ValueError(f"Fisher data is required for mode {mode!r}")
-            merged = self._diagonal_fisher_merging(weights_list, fisher_list, alphas)
+            if self._uses_full_fisher(weights_list, fisher_list):
+                merged = self._fisher_merging(
+                    weights_list, fisher_list, alphas, fisher_list_secondary,
+                )
+                return self._full_fisher_norm_max_rescale(weights_list, fisher_list, merged, alphas)
+            merged = self._diagonal_fisher_merging(
+                weights_list, fisher_list, alphas, fisher_list_secondary,
+            )
             return self._fisher_norm_max_rescale(weights_list, fisher_list, merged, alphas)
 
-        if mode == "diagonal_fisher_std_rescaled":
+        if mode in {"fisher_std_rescaled", "diagonal_fisher_std_rescaled"}:
             if fisher_list is None:
                 raise ValueError(f"Fisher data is required for mode {mode!r}")
-            merged = self._diagonal_fisher_merging(weights_list, fisher_list, alphas)
+            if self._uses_full_fisher(weights_list, fisher_list):
+                merged = self._fisher_merging(
+                    weights_list, fisher_list, alphas, fisher_list_secondary,
+                )
+            else:
+                merged = self._diagonal_fisher_merging(
+                    weights_list, fisher_list, alphas, fisher_list_secondary,
+                )
             return self._standard_norm_rescale(weights_list, merged, alphas)
 
         if mode == "diagonal_fisher_kl_rescaled":
             if fisher_list is None:
                 raise ValueError(f"Fisher data is required for mode {mode!r}")
+            if self.fisher_backend == "kfac":
+                raise ValueError("diagonal_fisher_kl_rescaled is only implemented for diagonal Fisher.")
             return self._diagonal_fisher_merging_kl_rescaled(
                 weights_list=weights_list,
                 fisher_list=fisher_list,
                 alphas=alphas,
             )
 
-        if mode == "fisher":
+        if mode == "full_fisher":
             if fisher_list is None:
                 raise ValueError(f"Fisher data is required for mode {mode!r}")
-            return self._fisher_merging(weights_list, fisher_list, alphas)
+            return self._fisher_merging(
+                weights_list, fisher_list, alphas, fisher_list_secondary,
+            )
 
         raise ValueError(f"Unsupported merge mode: {mode!r}")
 
     def apply_alphas(self, weights_list: List[Tensor], alphas: Tensor) -> Tensor:
         """Differentiable weighted sum of task vectors; alphas is (T,) or (T, L) broadcast to (T,).
+
+        Used by _AlphaOptimizerAdaMerging to apply a learned alpha vector for a single key.
+        Subclasses can override for non-Euclidean interpolation (e.g. Karcher mean).
         """
         stacked = torch.stack(weights_list, dim=0).float()  # (T, ...)
         a = alphas.to(stacked)
@@ -298,13 +390,12 @@ class OFTMerging(RiemannianMerging):
         Returns:
             Merged parameters of shape (num_blocks, d).
         """
-        num_models = len(weights_list)
         stacked = torch.stack(weights_list, dim=0)  # (T, num_blocks, n, n)
         if isinstance(alphas, torch.Tensor):
             a = alphas.to(dtype=stacked.dtype, device=stacked.device)
         else:
             a = torch.tensor(alphas, dtype=stacked.dtype, device=stacked.device)
-        return torch.einsum("t,t...->...", a, stacked) / num_models
+        return torch.einsum("t,t...->...", a, stacked)
 
     def _orthomerge_rescale(
         self,
@@ -322,7 +413,6 @@ class OFTMerging(RiemannianMerging):
         Returns:
             Rescaled merged parameters of shape (num_blocks, d).
         """
-        num_models = len(weights_list)
         stacked = torch.stack(weights_list, dim=0).float().to(merged.device)
         if isinstance(alphas, torch.Tensor):
             a = alphas.to(dtype=stacked.dtype, device=stacked.device)
@@ -334,7 +424,7 @@ class OFTMerging(RiemannianMerging):
 
         weighted = a * stacked
         sum_of_norms = torch.norm(weighted.flatten(1), p="fro", dim=1).sum()
-        norm_of_merged = torch.norm(num_models * merged.float(), p="fro")
+        norm_of_merged = torch.norm(merged.float(), p="fro")
         correction = sum_of_norms / norm_of_merged.clamp(min=1e-8)
         print("[orthomerge_rescale] " f"sum_of_norms={sum_of_norms.item():.6g}, " f"norm_of_sum={norm_of_merged.item():.6g}, " f"correction={correction.item():.6g}")
         return (correction * merged).to(dtype=weights_list[0].dtype)
@@ -385,11 +475,13 @@ class OFTMerging(RiemannianMerging):
             )
 
             correction = sum_of_norms / norm_of_merged.clamp(min=1e-8)
+            norm_rescaled = correction * norm_of_merged
 
             print(
                 "[fisher_norm_rescale] "
                 f"sum_of_norms={sum_of_norms.item():.6g}, "
                 f"norm_of_sum={norm_of_merged.item():.6g}, "
+                f"norm_rescaled={norm_rescaled.item():.6g}, "
                 f"correction={correction.item():.6g}"
             )
 
@@ -505,6 +597,7 @@ class OFTMerging(RiemannianMerging):
         weights_list: List[Tensor],
         fisher_list: List[Tensor],
         alphas,
+        fisher_list_secondary: Optional[List[Tensor]] = None,
     ) -> Tensor:
         """Merge OFT adapters using diagonal Fisher information as per-parameter weights.
 
@@ -517,6 +610,10 @@ class OFTMerging(RiemannianMerging):
             weights_list: T tensors of shape (num_blocks, d).
             fisher_list: T tensors of shape (num_blocks, d), diagonal Fisher estimates.
             alphas: T scalars or (T,) tensor.
+            fisher_list_secondary: Optional T tensors, a second Fisher source per task
+                (e.g. pretrained Fisher when fisher_list is finetuned). When given, each
+                task's Fisher is normalized independently on both sources, summed, and
+                normalized again -- see ``_normalize_and_combine_pair``.
 
         Returns:
             Merged parameters of shape (num_blocks, d).
@@ -525,12 +622,120 @@ class OFTMerging(RiemannianMerging):
         A = torch.zeros_like(ref, dtype=torch.float32)  # sum_t alpha_t * f_t
         b = torch.zeros_like(ref, dtype=torch.float32)  # sum_t alpha_t * (lam + f_t) * omega_t
 
-        for alpha_t, omega_t, f_t in zip(alphas, weights_list, fisher_list):
-            ft = f_t.float().to(ref.device)
+        kl_coords = self._kl_coords_for_fishers(weights_list)
+        for idx, (alpha_t, omega_t, f_t) in enumerate(zip(alphas, weights_list, fisher_list)):
+            kl_c = None if kl_coords is None else kl_coords[idx]
+            if fisher_list_secondary is not None:
+                ft = self._normalize_and_combine_pair(
+                    self._normalize_fisher_diagonal,
+                    f_t.float().to(ref.device),
+                    fisher_list_secondary[idx].float().to(ref.device),
+                    kl_coords=kl_c,
+                )
+            else:
+                ft = self._normalize_fisher_diagonal(
+                    f_t.float().to(ref.device),
+                    kl_coords=kl_c,
+                )
             A = A + alpha_t * ft
             b = b + alpha_t * (self.lam + ft) * omega_t.float().to(ref.device)
 
         return (b / (self.lam + A).clamp(min=1e-8)).to(ref.dtype)
+
+    def _kl_coords_for_fishers(self, weights_list: List[Tensor]) -> Optional[List[Tensor]]:
+        if self.fim_normalization != "kl":
+            return None
+        if len(weights_list) != 2:
+            raise ValueError("kl FIM normalization is only implemented for two-way Fisher merges.")
+        return [
+            weights_list[1].float().to(weights_list[0].device),
+            weights_list[0].float().to(weights_list[0].device),
+        ]
+
+    def _normalize_fisher_diagonal(
+        self,
+        diagonal: Tensor,
+        kl_coords: Optional[Tensor] = None,
+    ) -> Tensor:
+        diagonal = torch.nan_to_num(
+            diagonal.float(),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        ).clamp_min(0.0)
+        if self.fim_normalization == "trace":
+            denom = diagonal.sum(dim=-1).clamp_min(1e-8)
+            return diagonal / denom[..., None]
+        if self.fim_normalization == "frobenius":
+            denom = torch.linalg.vector_norm(diagonal, dim=-1).clamp_min(1e-8)
+            return diagonal / denom[..., None]
+        if self.fim_normalization == "layer-trace":
+            denom = diagonal.sum().clamp_min(1e-8)
+            return diagonal / denom
+        if self.fim_normalization == "layer-frobenius":
+            denom = torch.linalg.vector_norm(diagonal).clamp_min(1e-8)
+            return diagonal / denom
+        if self.fim_normalization == "none":
+            return diagonal
+        if kl_coords is None:
+            raise ValueError("kl FIM normalization requires coordinates of the other model.")
+        denom = (diagonal * kl_coords.float().square()).sum(dim=-1).clamp_min(1e-8)
+        return diagonal / denom[..., None]
+
+    def _normalize_fisher_matrix(
+        self,
+        matrix: Tensor,
+        kl_coords: Optional[Tensor] = None,
+    ) -> Tensor:
+        matrix = torch.nan_to_num(
+            matrix.float(),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        if self.fim_normalization == "trace":
+            denom = matrix.diagonal(dim1=-2, dim2=-1).sum(dim=-1).clamp_min(1e-8)
+            return matrix / denom[..., None, None]
+        if self.fim_normalization == "frobenius":
+            denom = torch.linalg.matrix_norm(matrix, ord="fro").clamp_min(1e-8)
+            return matrix / denom[..., None, None]
+        if self.fim_normalization == "layer-trace":
+            denom = matrix.diagonal(dim1=-2, dim2=-1).sum().clamp_min(1e-8)
+            return matrix / denom
+        if self.fim_normalization == "layer-frobenius":
+            denom = torch.linalg.vector_norm(matrix).clamp_min(1e-8)
+            return matrix / denom
+        if self.fim_normalization == "none":
+            return matrix
+        if kl_coords is None:
+            raise ValueError("kl FIM normalization requires coordinates of the other model.")
+        denom = torch.einsum(
+            "...i,...ij,...j->...",
+            kl_coords.float(),
+            matrix,
+            kl_coords.float(),
+        ).clamp_min(1e-8)
+        return matrix / denom[..., None, None]
+
+    def _normalize_and_combine_pair(
+        self,
+        normalize_fn,
+        primary: Tensor,
+        secondary: Tensor,
+        kl_coords: Optional[Tensor] = None,
+    ) -> Tensor:
+        """Combine two Fisher sources (e.g. finetuned/pretrained for fisher_source="average")
+        under normalization: normalize each independently, sum them, then normalize the sum.
+
+        Note this makes the combination invariant to averaging vs. summing the two normalized
+        terms (i.e. dividing by 2 first) -- every supported fim_normalization divides by a
+        functional of the tensor that is homogeneous of degree 1 (a trace, a norm, or a
+        quadratic form), so scaling the summed tensor by any positive constant before the
+        final normalize call cancels out in the ratio.
+        """
+        primary_norm = normalize_fn(primary, kl_coords=kl_coords)
+        secondary_norm = normalize_fn(secondary, kl_coords=kl_coords)
+        return normalize_fn(primary_norm + secondary_norm, kl_coords=kl_coords)
 
     def _diagonal_fisher_merging_kl_rescaled(
         self,
@@ -759,11 +964,147 @@ class OFTMerging(RiemannianMerging):
 
         return omega.to(dtype=ref.dtype)
 
+    def _kfac_to_fisher_matrix(self, fisher: Dict[str, Tensor], ref: Tensor) -> Tensor:
+        """Reconstruct saved row/column KFAC factors in the compact so(n) basis."""
+        row = fisher["row"].to(device=ref.device, dtype=torch.float32)
+        col = fisher["col"].to(device=ref.device, dtype=torch.float32)
+        scale = fisher["scale"].to(device=ref.device, dtype=torch.float32)
+
+        n = row.shape[-1]
+        d = ref.shape[-1]
+        expected_d = n * (n - 1) // 2
+        if d != expected_d:
+            raise ValueError(f"KFAC block size {n} implies d={expected_d}, got {d}.")
+
+        row = row.reshape(-1, n, n)
+        col = col.reshape(-1, n, n)
+        scale = scale.reshape(-1)
+        if row.shape[0] != ref.reshape(-1, d).shape[0]:
+            raise ValueError(
+                f"KFAC blocks {row.shape[0]} do not match weight blocks "
+                f"{ref.reshape(-1, d).shape[0]}."
+            )
+
+        p, q = torch.triu_indices(n, n, offset=1, device=ref.device)
+        matrix = row[:, p[:, None], p[None, :]] * col[:, q[:, None], q[None, :]]
+        matrix = scale[:, None, None] * matrix
+        matrix = 0.5 * (matrix + matrix.transpose(-1, -2))
+
+        diag_floor = fisher.get("diag_floor")
+        if diag_floor is not None:
+            floor = torch.as_tensor(diag_floor, device=ref.device, dtype=torch.float32)
+            eye = torch.eye(d, dtype=torch.float32, device=ref.device).expand_as(matrix)
+            matrix = matrix + floor * eye
+
+        return matrix.reshape(*ref.shape[:-1], d, d)
+
+    def _fisher_to_matrix(self, fisher: Tensor | Dict[str, Tensor], ref: Tensor) -> Tensor:
+        if isinstance(fisher, dict):
+            return self._kfac_to_fisher_matrix(fisher, ref)
+
+        fisher = fisher.to(device=ref.device, dtype=torch.float32)
+        if fisher.shape == ref.shape:
+            return torch.diag_embed(fisher.clamp(min=0.0))
+        if fisher.shape == (*ref.shape, ref.shape[-1]):
+            matrix = fisher
+            return 0.5 * (matrix + matrix.transpose(-1, -2))
+        raise ValueError(f"Unsupported Fisher shape {tuple(fisher.shape)} for {tuple(ref.shape)}.")
+
+    def _fisher_matrices(
+        self,
+        weights_list: List[Tensor],
+        fisher_list: List[Tensor | Dict[str, Tensor]],
+    ) -> List[Tensor]:
+        ref = weights_list[0]
+        return [self._fisher_to_matrix(fisher, ref) for fisher in fisher_list]
+
+    def _uses_full_fisher(
+        self,
+        weights_list: List[Tensor],
+        fisher_list: List[Tensor | Dict[str, Tensor]],
+    ) -> bool:
+        if self.fisher_backend == "kfac":
+            return True
+        ref = weights_list[0]
+        return any(
+            isinstance(fisher, dict)
+            or (
+                torch.is_tensor(fisher)
+                and fisher.shape == (*ref.shape, ref.shape[-1])
+            )
+            for fisher in fisher_list
+        )
+
+    def _full_fisher_norm_rescale(
+        self,
+        weights_list: List[Tensor],
+        fisher_list: List[Tensor | Dict[str, Tensor]],
+        merged: Tensor,
+        alphas,
+    ) -> Tensor:
+        weights = [w.to(device=merged.device, dtype=torch.float32) for w in weights_list]
+        fishers = self._fisher_matrices(weights_list, fisher_list)
+
+        if isinstance(alphas, torch.Tensor):
+            a = alphas.to(dtype=torch.float32, device=merged.device)
+        else:
+            a = torch.tensor(alphas, dtype=torch.float32, device=merged.device)
+
+        individual_norms = []
+        for omega_t, fisher_t in zip(weights, fishers):
+            energy = (omega_t.unsqueeze(-2) @ fisher_t @ omega_t.unsqueeze(-1)).sum()
+            individual_norms.append(torch.sqrt(energy.clamp(min=0.0)))
+        sum_of_norms = (a.abs() * torch.stack(individual_norms)).sum()
+
+        fisher_sum = torch.zeros_like(fishers[0])
+        for alpha_t, fisher_t in zip(a.abs(), fishers):
+            fisher_sum = fisher_sum + alpha_t * fisher_t
+
+        merged_f = merged.to(device=merged.device, dtype=torch.float32)
+        norm_of_merged = torch.sqrt(
+            (merged_f.unsqueeze(-2) @ fisher_sum @ merged_f.unsqueeze(-1)).sum().clamp(min=0.0)
+        )
+        correction = sum_of_norms / norm_of_merged.clamp(min=1e-8)
+        print(
+            "[full_fisher_norm_rescale] "
+            f"sum_of_norms={sum_of_norms.item():.6g}, "
+            f"norm_of_sum={norm_of_merged.item():.6g}, "
+            f"correction={correction.item():.6g}"
+        )
+        return (correction * merged).to(dtype=weights_list[0].dtype)
+
+    def _full_fisher_norm_max_rescale(
+        self,
+        weights_list: List[Tensor],
+        fisher_list: List[Tensor | Dict[str, Tensor]],
+        merged: Tensor,
+        alphas,
+    ) -> Tensor:
+        weights = [w.to(device=merged.device, dtype=torch.float32) for w in weights_list]
+        fishers = self._fisher_matrices(weights_list, fisher_list)
+
+        if isinstance(alphas, torch.Tensor):
+            a = alphas.to(dtype=torch.float32, device=merged.device).abs()
+        else:
+            a = torch.tensor(alphas, dtype=torch.float32, device=merged.device).abs()
+
+        merged_f = merged.to(device=merged.device, dtype=torch.float32)
+        ratios = []
+        for alpha_t, omega_t, fisher_t in zip(a, weights, fishers):
+            target = alpha_t * (omega_t.unsqueeze(-2) @ fisher_t @ omega_t.unsqueeze(-1)).sum()
+            actual = (merged_f.unsqueeze(-2) @ fisher_t @ merged_f.unsqueeze(-1)).sum()
+            ratios.append(target / actual.clamp(min=1e-8))
+
+        correction = torch.sqrt(torch.stack(ratios).clamp(min=0.0)).max()
+        print("[full_fisher_norm_max_rescale] " f"correction={correction.item():.6g}")
+        return (correction * merged).to(dtype=weights_list[0].dtype)
+
     def _fisher_merging(
         self,
         weights_list: List[Tensor],
-        fisher_list: List[Tensor],
+        fisher_list: List[Tensor | Dict[str, Tensor]],
         alphas: List[float],
+        fisher_list_secondary: Optional[List[Tensor | Dict[str, Tensor]]] = None,
     ) -> Tensor:
         """Merge OFT adapters using full Fisher information matrices as per-parameter weights.
 
@@ -771,32 +1112,51 @@ class OFTMerging(RiemannianMerging):
             weights_list: T tensors of shape (num_blocks, d), skew-symmetric parameters per task.
             fisher_list: T tensors of shape (num_blocks, d, d), full Fisher matrices per task.
             alphas: T scalars, one mixing coefficient per task.
+            fisher_list_secondary: Optional T tensors/dicts, a second Fisher source per task
+                (e.g. pretrained Fisher when fisher_list is finetuned). When given, each
+                task's Fisher is normalized independently on both sources, summed, and
+                normalized again -- see ``_normalize_and_combine_pair``.
 
         Returns:
             Merged parameters of shape (num_blocks, d).
         """
-        raise NotImplementedError("Full Fisher merging is not implemented yet.")
-        num_blocks, son_dimension = weights_list[0].shape
-        dtype, device = weights_list[0].dtype, weights_list[0].device
-        block_size = int((1 + (1 + 8 * son_dimension) ** 0.5) / 2)
+        ref = weights_list[0]
+        dtype, device = ref.dtype, ref.device
+        d = ref.shape[-1]
+        weights = [w.to(device=device, dtype=torch.float32) for w in weights_list]
+        fishers = self._fisher_matrices(weights_list, fisher_list)
+        fishers_secondary = (
+            self._fisher_matrices(weights_list, fisher_list_secondary)
+            if fisher_list_secondary is not None
+            else None
+        )
 
-        Id = torch.eye(son_dimension, dtype=dtype, device=device).unsqueeze(0)
+        if isinstance(alphas, torch.Tensor):
+            alpha_tensors = alphas.to(device=device, dtype=torch.float32)
+        else:
+            alpha_tensors = torch.tensor(alphas, dtype=torch.float32, device=device)
 
-        A = self.lam * Id.expand(num_blocks, -1, -1).clone()
-        b = torch.zeros(num_blocks, son_dimension, dtype=dtype, device=device)
+        eye = torch.eye(d, dtype=torch.float32, device=device).expand(*ref.shape[:-1], d, d)
+        A = self.lam * eye.clone()
+        b = torch.zeros_like(ref, dtype=torch.float32, device=device)
 
-        for alpha_t, oft_params_t, fisher_t in zip(alphas, weights_list, fisher_list):
-            # Reconstruct skew-symmetric matrices
-            skew_matrix = self.oft_params_to_skew_matrix(oft_params_t, son_dimension)  # (num_blocks, n, n)
-            Pt = self.manifold.compute_Pt(skew_matrix, block_size)  # (num_blocks, d, d)
+        kl_coords = self._kl_coords_for_fishers(weights)
+        for idx, (alpha_t, omega_t, fisher_t) in enumerate(zip(alpha_tensors, weights, fishers)):
+            kl_c = None if kl_coords is None else kl_coords[idx]
+            if fishers_secondary is not None:
+                ft = self._normalize_and_combine_pair(
+                    self._normalize_fisher_matrix,
+                    fisher_t,
+                    fishers_secondary[idx],
+                    kl_coords=kl_c,
+                )
+            else:
+                ft = self._normalize_fisher_matrix(fisher_t, kl_coords=kl_c)
+            A = A + alpha_t * ft
+            b = b + alpha_t * ((self.lam * eye + ft) @ omega_t.unsqueeze(-1)).squeeze(-1)
 
-            F_tilde = Pt @ fisher_t @ Pt.transpose(-2, -1)
-
-            A += alpha_t * F_tilde
-            rhs = (self.lam * Id.squeeze(0) + F_tilde) @ oft_params_t.unsqueeze(-1)
-            b += alpha_t * rhs.squeeze(-1)
-
-        return torch.linalg.solve(A, b.unsqueeze(-1)).squeeze(-1)
+        system = A + 1e-8 * eye
+        return torch.linalg.solve(system, b.unsqueeze(-1)).squeeze(-1).to(dtype)
 
     def fisher_full_task_vectors(
         self,
@@ -889,7 +1249,37 @@ class OFTMerging(RiemannianMerging):
         adapter_paths: List[str],
         fisher_paths: Optional[List[str]] = None,
         mode: MergeMode = "standard",
+        optimize_alphas: Optional[str] = None,
+        model=None,
+        task_loaders: Optional[List] = None,
+        task_names: Optional[List[str]] = None,
+        fisher_paths_secondary: Optional[List[str]] = None,
     ):
+        """
+        Args:
+            fisher_paths_secondary: Optional second per-task Fisher source, aligned with
+                ``fisher_paths`` (e.g. pretrained Fisher paths when ``fisher_paths`` are
+                finetuned). When given, each task's Fisher is normalized on both sources
+                independently, summed, and normalized again before merging -- see
+                ``_normalize_and_combine_pair``. Ignored when ``optimize_alphas`` is set.
+        """
+        if optimize_alphas is not None:
+            valid_alpha_opts = ("adamerging", "adamergingpp", "adamerging_equal", "adamergingpp_equal")
+            if optimize_alphas not in valid_alpha_opts:
+                raise ValueError(
+                    f"optimize_alphas must be one of {valid_alpha_opts},"
+                    f" got {optimize_alphas!r}"
+                )
+            if model is None or task_loaders is None or task_names is None:
+                raise ValueError("optimize_alphas requires model, task_loaders, and task_names")
+            opt = _AlphaOptimizerAdaMerging(
+                merger=self,
+                equal_alphas=optimize_alphas.endswith("_equal"),
+                device=self.device,
+            )
+            opt.use_pp = optimize_alphas.startswith("adamergingpp")
+            return opt.optimize(adapter_paths, model, task_loaders, task_names, fisher_paths, mode)
+
         print(f"\nMerging {len(adapter_paths)} OFT adapters with {mode} mode...")
 
         # Load weights
@@ -899,6 +1289,9 @@ class OFTMerging(RiemannianMerging):
 
         # Load Fishers
         all_fishers = self.load_fishers(fisher_paths) if fisher_paths else None
+        all_fishers_secondary = (
+            self.load_fishers(fisher_paths_secondary) if fisher_paths_secondary else None
+        )
 
         merged_weights = {}
 
@@ -911,12 +1304,19 @@ class OFTMerging(RiemannianMerging):
 
                 fishers_layer = None
                 if all_fishers:
-                    fishers_layer = [fisher[key] for fisher in all_fishers]
+                    fishers_layer = [self._layer_fisher(fisher, key) for fisher in all_fishers]
+
+                fishers_layer_secondary = None
+                if all_fishers_secondary:
+                    fishers_layer_secondary = [
+                        self._layer_fisher(fisher, key) for fisher in all_fishers_secondary
+                    ]
 
                 avg_weight = self.merge_formula(
                     weights_list=weights_layer,
                     fisher_list=fishers_layer,
                     mode=mode,
+                    fisher_list_secondary=fishers_layer_secondary,
                 )
 
                 merged_weights[key] = avg_weight
@@ -926,3 +1326,845 @@ class OFTMerging(RiemannianMerging):
 
         print(f"  Merged {len(merged_weights)} weight tensors")
         return merged_weights
+
+
+class OFTKarcherMerging(OFTMerging):
+    """
+    Karcher (Frechet) mean merging for OFT adapters on SO(n).
+
+    standard:        isotropic Karcher mean via Riemannian gradient descent.
+    diagonal_fisher: Fisher-weighted Karcher mean via gradient descent on so(n) coords.
+    """
+
+    def __init__(
+        self,
+        n_steps: int = 200,
+        lr: float = 0.1,
+        lam: float = 0.0,
+        alphas: Optional[List[float]] = None,
+        device: str = "cpu",
+    ):
+        super().__init__(lam=lam, alphas=alphas, device=device)
+        self.n_steps = n_steps
+        self.lr = lr
+
+    def _matrix_log_skew(self, R: Tensor) -> Tensor:
+        """Stable SO(n) log via Cayley inverse: 2(R-I)(R+I)^{-1}.
+
+        Avoids eig (unstable gradients for near-degenerate eigenvalues). Valid
+        for all rotations except R ~= -I (rotation angle ~= pi).
+        """
+        return self.manifold.cayley_inverse_log(R)
+
+    def merge_formula(
+        self,
+        weights_list: List[Tensor],
+        fisher_list: Optional[List[Dict[str, Tensor]]] = None,
+        mode: MergeMode = "standard",
+        alphas: Optional[Tensor] = None,
+    ) -> Tensor:
+        if alphas is None:
+            alphas = (
+                torch.tensor(self.alphas, dtype=torch.float32)
+                if self.alphas is not None
+                else torch.ones(1, dtype=torch.float32)
+            ).to(self.device)
+
+        if mode == "standard":
+            result = self._karcher_merging(weights_list, alphas)
+        elif mode == "diagonal_fisher":
+            if fisher_list is None:
+                raise ValueError(f"Fisher data required for mode {mode!r}")
+            result = self._fisher_karcher_merging(weights_list, fisher_list, alphas)
+        else:
+            raise ValueError(f"Unsupported merge mode: {mode!r}")
+
+        return result
+
+    def _riemannian_karcher(
+        self,
+        weights_list: List[Tensor],
+        alphas: Tensor,
+        fisher_list: Optional[List[Tensor]] = None,
+    ) -> Tensor:
+        """Karcher mean on SO(n) via RiemannianAdam (geoopt).
+
+        Standard:  minimises sum_t alpha_t/2 * ||Omega_t||_F^2,  Omega_t = log(R_t^T R_m).
+        Fisher:    minimises sum_t alpha_t/2 * <eta_t, f_t * eta_t>,
+                   eta_t = coord(Omega_t) in the upper-tri so(n) basis.
+                   f_t is the diagonal parameter-space Fisher -- an approximation of the full
+                   coordinate Fisher F_t^SO = (E_ij theta_0)^T R_t^T F_t R_t (E_kl theta_0).
+        R_m lives on the Stiefel manifold; RiemannianAdam handles gradient projection + retraction.
+        """
+        if geoopt is None:
+            raise ImportError("OFTKarcherMerging requires geoopt to be installed.")
+
+        son_dimension = weights_list[0].shape[1]
+        R_list = [
+            torch.matrix_exp(self.oft_params_to_skew_matrix(w.float(), son_dimension)).detach()
+            for w in weights_list
+        ]
+
+        alphas_d = alphas.detach().cpu()
+        mean_w = torch.einsum(
+            "t,tbd->bd", alphas_d,
+            torch.stack([w.float().cpu() for w in weights_list]),
+        ).to(self.device)
+        R_m = geoopt.ManifoldParameter(
+            torch.matrix_exp(self.oft_params_to_skew_matrix(mean_w.detach(), son_dimension)),
+            manifold=geoopt.Stiefel(),
+        )
+        inner_opt = geoopt.optim.RiemannianAdam([R_m], lr=self.lr)
+
+        alphas_d_dev = alphas_d.to(self.device)
+        convergence_interval = max(1, self.n_steps // 10)
+        for step in range(self.n_steps):
+            should_track_convergence = (
+                wandb.run is not None
+                and hasattr(self, "_karcher_convergence")
+                and (
+                    step == 0
+                    or (step + 1) % convergence_interval == 0
+                    or step + 1 == self.n_steps
+                )
+            )
+            previous_R_m = R_m.detach().clone() if should_track_convergence else None
+            inner_opt.zero_grad()
+            loss: Tensor = torch.zeros(1, device=self.device)
+            fisher_iter = iter(fisher_list) if fisher_list is not None else None
+            for alpha_t, R_t in zip(alphas_d_dev, R_list):
+                omega_t = self._matrix_log_skew(R_t.transpose(-1, -2) @ R_m)
+                if fisher_iter is not None:
+                    eta = self.skew_matrix_to_oft_params(omega_t)
+                    loss = loss + alpha_t * 0.5 * (next(fisher_iter).float() * eta.pow(2)).sum()
+                else:
+                    loss = loss + alpha_t * 0.5 * omega_t.pow(2).sum()
+            loss.backward()
+            inner_opt.step()
+            if previous_R_m is not None:
+                with torch.no_grad():
+                    step_omega = self._matrix_log_skew(
+                        previous_R_m.transpose(-1, -2) @ R_m.detach()
+                    )
+                    current_omega = self._matrix_log_skew(R_m.detach())
+                    step_delta = step_omega.norm().item()
+                    current_norm = current_omega.norm().item()
+                    self._karcher_convergence[step + 1]["delta"].append(step_delta)
+                    self._karcher_convergence[step + 1]["relative_delta"].append(
+                        step_delta / (current_norm + 1e-12)
+                    )
+                    self._karcher_convergence[step + 1]["loss"].append(loss.item())
+
+        self._last_loss: float = loss.item()
+        with torch.no_grad():
+            merged = self.skew_matrix_to_oft_params(self._matrix_log_skew(R_m.detach()))
+            t_norms = [w.float().norm().item() for w in weights_list]
+            # print(
+            #     f"    ||omega_m||={merged.float().norm().item():.4f}  "
+            #     f"sum||xi_t||={sum(t_norms):.4f}  "
+            #     f"mean||xi_t||={sum(t_norms)/len(t_norms):.4f}  "
+            #     f"loss={self._last_loss:.6f}"
+            # )
+        return merged.to(weights_list[0].dtype)
+
+    def _karcher_merging(self, weights_list: List[Tensor], alphas: Tensor) -> Tensor:
+        """Isotropic Karcher mean: arg min_R sum_t alpha_t/2 * ||log(R_t^T R)||_F^2."""
+        return self._riemannian_karcher(weights_list, alphas)
+
+    def _fisher_karcher_merging(
+        self,
+        weights_list: List[Tensor],
+        fisher_list: List[Tensor],
+        alphas: Tensor,
+    ) -> Tensor:
+        """Fisher-weighted Karcher mean: arg min_R sum_t alpha_t/2 * f_t * eta_t^2."""
+        return self._riemannian_karcher(weights_list, alphas, fisher_list)
+
+    def merge(
+        self,
+        adapter_paths: List[str],
+        fisher_paths: Optional[List[str]] = None,
+        mode: MergeMode = "standard",
+        optimize_alphas: Optional[str] = None,
+        model=None,
+        task_loaders: Optional[List] = None,
+        task_names: Optional[List[str]] = None,
+    ) -> Dict[str, Tensor]:
+        if optimize_alphas is not None:
+            valid_alpha_opts = ("adamerging", "adamergingpp", "adamerging_equal", "adamergingpp_equal")
+            if optimize_alphas not in valid_alpha_opts:
+                raise ValueError(
+                    f"optimize_alphas must be one of {valid_alpha_opts},"
+                    f" got {optimize_alphas!r}"
+                )
+            if model is None or task_loaders is None or task_names is None:
+                raise ValueError("optimize_alphas requires model, task_loaders, and task_names")
+            opt = _AlphaOptimizerAdaMerging(
+                merger=self,
+                equal_alphas=optimize_alphas.endswith("_equal"),
+                device=self.device,
+            )
+            opt.use_pp = optimize_alphas.startswith("adamergingpp")
+            return opt.optimize(adapter_paths, model, task_loaders, task_names, fisher_paths, mode)
+
+        print(f"\nMerging {len(adapter_paths)} OFT adapters with Karcher mean ({mode})...")
+        all_weights = self.load_weights(adapter_paths)
+        if not all_weights:
+            raise ValueError("No valid adapter weights found!")
+        all_fishers = self.load_fishers(fisher_paths) if fisher_paths else None
+
+        merged_weights: Dict[str, Tensor] = {}
+        key_losses: Dict[str, float] = {}
+        self._karcher_convergence = defaultdict(lambda: defaultdict(list))
+
+        for key in all_weights[0].keys():
+            if "oft_r" in key or ("oft_" in key.lower() and "classifier" not in key.lower()):
+                print(f"  Processing key: {key}")
+                weights_layer = [w[key] for w in all_weights]
+                fishers_layer = [f[key] for f in all_fishers] if all_fishers else None
+                merged_weights[key] = self.merge_formula(weights_layer, fishers_layer, mode)
+                key_losses[key] = self._last_loss
+            else:
+                print("[WARNING] Non-OFT weight detected.")
+
+        print(f"  Merged {len(merged_weights)} weight tensors")
+
+        if wandb.run is not None and key_losses:
+            by_num: dict = defaultdict(list)
+            by_type: dict = defaultdict(list)
+            for key, v in key_losses.items():
+                m = re.search(r'(\d+)\.(.+)$', key)
+                by_num[m.group(1) if m else "0"].append(v)
+                by_type[m.group(2) if m else key].append(v)
+            wandb.log({
+                **{f"karcher/layer/{n}": sum(vs) / len(vs) for n, vs in by_num.items()},
+                **{f"karcher/type/{t}": sum(vs) / len(vs) for t, vs in by_type.items()},
+            })
+            for iteration, metrics in sorted(self._karcher_convergence.items()):
+                wandb.log({
+                    "karcher/convergence/iteration": iteration,
+                    "karcher/convergence/mean_delta": (
+                        sum(metrics["delta"]) / len(metrics["delta"])
+                    ),
+                    "karcher/convergence/mean_relative_delta": (
+                        sum(metrics["relative_delta"]) / len(metrics["relative_delta"])
+                    ),
+                    "karcher/convergence/mean_loss": (
+                        sum(metrics["loss"]) / len(metrics["loss"])
+                    ),
+                })
+
+        return merged_weights
+
+
+class OrthoMergeCOFTMerging(OFTMerging):
+    """OrthoMerge-C Cayley averaging for OFT adapters.
+
+    Public inputs/outputs stay in OFT coordinates ``(num_blocks, d)``.
+    The OrthoMerge-C Cayley step is done in skew-matrix coordinates
+    ``(num_blocks, n, n)``, matching the standalone scripts.
+    """
+
+    def __init__(
+        self,
+        lam: float = 0.0,
+        alphas: Optional[List[float]] = None,
+        device: str = "cpu",
+        theta_agg: str = "mean",
+        direction_weight: str = "theta",
+    ):
+        super().__init__(lam=lam, alphas=alphas, device=device)
+        self.theta_agg = theta_agg
+        self.direction_weight = direction_weight
+
+    def _merge_cayley_Q_list(
+        self,
+        weights_list: List[Tensor],
+        theta_agg: Optional[str] = None,
+        direction_weight: Optional[str] = None,
+    ) -> Tensor:
+        base_shape = weights_list[0].shape
+        Q_stack = torch.stack(weights_list, dim=0)
+        Q_flat = Q_stack.reshape(Q_stack.shape[0], -1)
+
+        theta = torch.linalg.vector_norm(Q_flat, dim=1)
+        u = Q_flat / theta.clamp(min=1e-8).unsqueeze(1)
+
+        direction_weight = direction_weight or self.direction_weight
+        if direction_weight == "theta":
+            w = theta
+        elif direction_weight == "uniform":
+            w = torch.ones_like(theta)
+        else:
+            raise ValueError(f"Unknown direction_weight: {direction_weight}")
+
+        u_sum = (u * w.unsqueeze(1)).sum(dim=0)
+        u_sum_norm = torch.linalg.vector_norm(u_sum)
+        if u_sum_norm < 1e-8:
+            return torch.zeros(base_shape, device=Q_flat.device, dtype=Q_flat.dtype)
+
+        theta_agg = theta_agg or self.theta_agg
+        if theta_agg == "mean":
+            theta_merge = theta.mean()
+        elif theta_agg == "median":
+            theta_merge = theta.median()
+        elif theta_agg == "max":
+            theta_merge = theta.max()
+        else:
+            raise ValueError(f"Unknown theta_agg: {theta_agg}")
+
+        merged = (u_sum / u_sum_norm * theta_merge).reshape(base_shape)
+        return 0.5 * (merged - merged.transpose(-1, -2))
+
+    def merge_formula(
+        self,
+        weights_list: List[Tensor],
+        fisher_list: Optional[List[Dict[str, Tensor]]] = None,
+        mode: MergeMode = "standard",
+        alphas: Optional[Tensor] = None,
+    ) -> Tensor:
+        if mode != "standard":
+            raise ValueError(f"{self.__class__.__name__} only supports standard mode.")
+
+        son_dimension = weights_list[0].shape[-1]
+        skew_list = [
+            self.oft_params_to_skew_matrix(w.float().to(self.device), son_dimension)
+            for w in weights_list
+        ]
+        merged_skew = self._merge_cayley_Q_list(skew_list)
+        return self.skew_matrix_to_oft_params(merged_skew).to(weights_list[0].dtype)
+
+
+class OrthoMergeCTIESOFTMerging(OrthoMergeCOFTMerging):
+    """OrthoMerge-C + TIES for OFT coordinate tensors.
+
+    The Cayley helper inherited from ``OrthoMergeCOFTMerging`` uses skew
+    matrices; the TIES residual merge from the scripts operates on parameter
+    deltas, so here it is applied directly to OFT coordinates.
+    """
+
+    def __init__(
+        self,
+        lam: float = 0.0,
+        alphas: Optional[List[float]] = None,
+        device: str = "cpu",
+        reset_thresh: float = 0.2,
+        chunk_size: int = 50_000_000,
+    ):
+        super().__init__(lam=lam, alphas=alphas, device=device)
+        self.reset_thresh = reset_thresh
+        self.chunk_size = chunk_size
+
+    def _ties(self, weights_list: List[Tensor]) -> Tensor:
+        kept_list = []
+        for delta in weights_list:
+            delta = delta.to(self.device)
+            k = int(delta.numel() * (1 - self.reset_thresh))
+            k = min(max(k, 1), delta.numel())
+            kth_val = delta.abs().flatten().kthvalue(k).values
+            kept_list.append(delta * (delta.abs() >= kth_val))
+
+        flat_kept = [k.reshape(-1) for k in kept_list]
+        total_params = flat_kept[0].numel()
+        merged = torch.zeros(total_params, dtype=flat_kept[0].dtype, device=self.device)
+
+        for start in range(0, total_params, self.chunk_size):
+            end = min(start + self.chunk_size, total_params)
+            task_chunks = [k[start:end] for k in flat_kept]
+            chunk_sum = torch.stack(task_chunks, dim=0).sum(dim=0)
+            final_signs = torch.sign(chunk_sum)
+            final_signs[final_signs == 0] = 1.0
+
+            numerator = torch.zeros_like(chunk_sum)
+            denominator = torch.zeros_like(chunk_sum)
+            for chunk in task_chunks:
+                keep = torch.where(final_signs > 0, chunk > 0, chunk < 0).to(chunk)
+                kept = chunk * keep
+                numerator += kept
+                denominator += (kept != 0).to(chunk)
+
+            merged[start:end] = numerator / denominator.clamp(min=1)
+
+        return merged.view_as(weights_list[0])
+
+    def merge_formula(
+        self,
+        weights_list: List[Tensor],
+        fisher_list: Optional[List[Dict[str, Tensor]]] = None,
+        mode: MergeMode = "standard",
+        alphas: Optional[Tensor] = None,
+    ) -> Tensor:
+        if mode != "standard":
+            raise ValueError(f"{self.__class__.__name__} only supports standard mode.")
+        return self._ties(weights_list).to(weights_list[0].dtype)
+
+
+class OrthoMergeCTSVMOFTMerging(OrthoMergeCOFTMerging):
+    """OrthoMerge-C + TSV-Merge for OFT coordinate tensors."""
+
+    def __init__(
+        self,
+        lam: float = 0.0,
+        alphas: Optional[List[float]] = None,
+        device: str = "cpu",
+        exclude_matrix_svd: bool = False,
+    ):
+        super().__init__(lam=lam, alphas=alphas, device=device)
+        self.exclude_matrix_svd = exclude_matrix_svd
+
+    def _tsvm(self, weights_list: List[Tensor]) -> Tensor:
+        num_tasks = len(weights_list)
+        sv_reduction = 1.0 / num_tasks
+        ref = weights_list[0]
+        tensors = [w.to(self.device) for w in weights_list]
+
+        if ref.dim() != 2 or self.exclude_matrix_svd:
+            acc = tensors[0].clone()
+            for i, tensor in enumerate(tensors[1:], start=1):
+                acc += (tensor - acc) / (i + 1)
+            return acc
+
+        Ui_list = []
+        Si_list = []
+        Vi_list = []
+        rows, cols = ref.shape
+
+        for tensor in tensors:
+            mat = tensor.float()
+            Ui, Si, Vhi = torch.linalg.svd(mat, full_matrices=False)
+            reduced_rank = max(1, int(Si.shape[0] * sv_reduction))
+            Ui_list.append(Ui[:, :reduced_rank])
+            Si_list.append(Si[:reduced_rank])
+            Vi_list.append(Vhi[:reduced_rank, :])
+
+        r_list = [U.shape[1] for U in Ui_list]
+        sum_r = sum(r_list)
+        U_concat = torch.zeros(rows, sum_r, device=self.device, dtype=torch.float32)
+        V_concat = torch.zeros(cols, sum_r, device=self.device, dtype=torch.float32)
+        S_block = torch.zeros(sum_r, device=self.device, dtype=torch.float32)
+
+        offset = 0
+        for i in range(num_tasks):
+            r_i = r_list[i]
+            U_concat[:, offset:offset + r_i] = Ui_list[i]
+            V_concat[:, offset:offset + r_i] = Vi_list[i].transpose(0, 1)
+            S_block[offset:offset + r_i] = Si_list[i]
+            offset += r_i
+
+        PU, _, QUt = torch.linalg.svd(U_concat, full_matrices=False)
+        PV, _, QVt = torch.linalg.svd(V_concat, full_matrices=False)
+        U_hat = PU @ QUt
+        V_hat = PV @ QVt
+        return ((U_hat * S_block.unsqueeze(0)) @ V_hat.transpose(0, 1)).to(ref.dtype)
+
+    def merge_formula(
+        self,
+        weights_list: List[Tensor],
+        fisher_list: Optional[List[Dict[str, Tensor]]] = None,
+        mode: MergeMode = "standard",
+        alphas: Optional[Tensor] = None,
+    ) -> Tensor:
+        if mode != "standard":
+            raise ValueError(f"{self.__class__.__name__} only supports standard mode.")
+        return self._tsvm(weights_list).to(weights_list[0].dtype)
+
+
+class WudiOFTMerging(OFTMerging):
+    """
+    WUDI merging for OFT on SO(n).
+
+    Optimizes merged Lie-algebra coordinates via Adam to minimise a
+    direction-alignment loss across tasks, then returns the result in
+    the same oft_params format as the other merging methods.
+    """
+
+    def __init__(self, n_steps: int = 200, lr: float = 1e-3, device: str = "cpu"):
+        super().__init__(lam=1.0, alphas=None, device=device)
+        self.n_steps = n_steps
+        self.lr = lr
+
+    def merge_formula(
+        self,
+        weights_list: List[Tensor],
+        fisher_list: Optional[List[Dict[str, Tensor]]] = None,
+        mode: MergeMode = "standard",
+    ) -> Tensor:
+        """Merge OFT task vectors via WUDI optimisation in so(n) coordinate space.
+
+        Args:
+            weights_list: T tensors of shape (num_blocks, d), skew-symmetric so(n) parameters per task.
+            fisher_list: Unused; kept for interface compatibility.
+            mode: Unused; kept for interface compatibility.
+
+        Returns:
+            Merged OFT parameters of shape (num_blocks, d).
+        """
+        task_vectors = None
+        if "fisher" in mode:
+            task_vectors = self.fisher_full_task_vectors(weights_list, fisher_list, self.alphas)
+        elif mode == "standard":
+            task_vectors = weights_list
+        else:
+            raise ValueError(f"Unsupported merge mode for WUDI: {mode!r}")
+        return self._wudi_merging(task_vectors)
+
+    def _wudi_merging(self, weights_list: List[Tensor]) -> Tensor:
+        """
+        Algorithm 1: WUDI-Merging adapted for OFT on SO(n).
+
+        Operates in skew-symmetric (Lie algebra) space.
+        The task vectors here are the skew matrices themselves.
+
+        Loss (Eq. 21):
+            L = sum_i (1 / ||tau_i||^2_F) * ||(tau_m - tau_i)(tau_i)^T||^2_F
+
+        Args:
+            weights_list: T tensors of shape (num_blocks, d),
+                        each being OFT upper-tri coordinates (task vectors).
+        Returns:
+            Merged coordinates of shape (num_blocks, d).
+        """
+        T = len(weights_list)
+        _, son_dimension = weights_list[0].shape
+
+        # Convert task vectors from upper-tri coordinates to skew matrices
+        # tau_{i,l} in paper corresponds to skew matrices here
+        tau_list = []
+        tau_norm_sq_list = []
+        for w in weights_list:
+            tau = self.oft_params_to_skew_matrix(w.float(), son_dimension).detach()
+            tau_list.append(tau)
+            # ||tau_{i,l}||^2_F per block
+            norm_sq = tau.pow(2).sum(dim=(-2, -1)).clamp(min=1e-8)
+            tau_norm_sq_list.append(norm_sq)
+
+        # Precompute tau_i^T for each task (for skew matrices, tau^T = -tau,
+        # but we keep it explicit to match the paper exactly)
+        tau_T_list = [tau.transpose(-2, -1) for tau in tau_list]
+
+        # Step 1: Initialize tau^0_{m,l} = sum_i tau_{i,l} (Algorithm 1, line 3)
+        tau_m_init = torch.stack(tau_list).sum(dim=0)
+
+        # Optimise in skew-matrix space directly
+        tau_m = tau_m_init.clone().detach().requires_grad_(True)
+        optimizer = torch.optim.Adam([tau_m], lr=self.lr)
+
+        # Step 2: Optimise (Algorithm 1, lines 5-9)
+        for step in range(self.n_steps):
+            optimizer.zero_grad()
+
+            loss = torch.tensor(0.0, device=self.device, dtype=torch.float32)
+            for t in range(T):
+                # delta_i = tau_m - tau_i (Eq. 2)
+                delta = tau_m - tau_list[t]
+
+                # ||delta_i * (tau_i)^T||^2_F (Eq. 21)
+                prod = delta @ tau_T_list[t]                    # (num_blocks, n, n)
+                frob_sq = prod.pow(2).sum(dim=(-2, -1))         # (num_blocks,)
+
+                # Weighted by 1/||tau_i||^2_F (balanced weighting, Eq. 21)
+                loss = loss + (frob_sq / tau_norm_sq_list[t]).sum()
+
+            loss.backward()
+            optimizer.step()
+
+        # Convert back from skew matrix to upper-tri OFT coordinates
+        merged_params = self.skew_matrix_to_oft_params(tau_m.detach())
+        return merged_params.to(weights_list[0].dtype)
+
+
+class AdaMergingPP:
+    """AdaMerging++ for OFT adapters: TIES preprocessing + entropy-based alpha optimization.
+
+    Wraps _AlphaOptimizerAdaMerging(OFTMerging) and applies TIES trimming to task vectors before
+    delegating the entropy loop to _AlphaOptimizerAdaMerging.optimize_from_vecs.
+    """
+
+    def __init__(
+        self,
+        n_iters: int = 100,
+        lr: float = 1e-2,
+        max_batch_size: int = 64,
+        ties_trim_ratio: float = 0.2,
+        init_lambda: float = 0.3,
+        log_wandb: bool = True,
+        device: str = "cpu",
+    ) -> None:
+        self.ties_trim_ratio = ties_trim_ratio
+        self.device = device
+        self._opt = _AlphaOptimizerAdaMerging(
+            merger=OFTMerging(device=device),
+            n_iters=n_iters,
+            lr=lr,
+            max_batch_size=max_batch_size,
+            init_alpha=init_lambda,
+            log_wandb=log_wandb,
+            device=device,
+        )
+
+    @staticmethod
+    def _ties(vecs: List[Tensor], trim_ratio: float) -> List[Tensor]:
+        """TIES: trim, elect sign, disjoint mask."""
+        T, shape = len(vecs), vecs[0].shape
+        flat = torch.stack(vecs).float().view(T, -1)
+        D = flat.shape[1]
+        k = max(1, int(trim_ratio * D))
+        thresh = flat.abs().kthvalue(D - k + 1, dim=1, keepdim=True).values
+        trimmed = flat * (flat.abs() >= thresh)
+        elected = torch.where(
+            (trimmed * (trimmed > 0)).sum(0) >= (trimmed.abs() * (trimmed < 0)).sum(0),
+            torch.ones(D, device=flat.device), -torch.ones(D, device=flat.device),
+        )
+        mask = (trimmed.sign() == elected.unsqueeze(0)) | (trimmed == 0)
+        phi = trimmed * mask
+        return [phi[t].view(shape) for t in range(T)]
+
+    def merge(self, adapter_paths: List[str], model, task_loaders: List,
+              task_names: List[str]) -> Dict[str, Tensor]:
+        T = len(adapter_paths)
+        assert len(task_loaders) == T == len(task_names)
+
+        all_w = self._opt.merger.load_weights(adapter_paths)
+        oft_keys = sorted(k for k in all_w[0]
+                          if "oft_r" in k or ("oft_" in k.lower() and "classifier" not in k.lower()))
+        assert oft_keys, "No OFT keys found"
+
+        # TIES preprocessing
+        task_vecs = {
+            k: self._ties([w[k].float().to(self.device) for w in all_w], self.ties_trim_ratio)
+            for k in oft_keys
+        }
+
+        params = dict(model.named_parameters())
+        key_map = {}
+        for k in oft_keys:
+            for c in [k, k.replace(".weight", ".default.weight")]:
+                if c in params:
+                    key_map[k] = c
+                    break
+        keys = [k for k in oft_keys if k in key_map]
+        assert keys, "No keys mapped"
+
+        base = {k: params[key_map[k]].data.clone().float().to(self.device) for k in keys}
+        task_vecs = {k: task_vecs[k] for k in keys}
+
+        return self._opt.optimize_from_vecs(
+            task_vecs, base, key_map, keys, all_w[0], model, task_loaders, task_names,
+            mode="standard", fisher_list=None,
+        )
+
+
+class _AlphaOptimizerAdaMerging:
+    """Entropy-based alpha optimizer for any RiemannianMerging subclass.
+
+    Wraps a merger and learns per-task, per-layer mixing coefficients via
+    entropy minimization on unlabeled data, exactly as AdaMerging++ does but
+    delegating the actual interpolation to `merger.merge_formula`.
+
+    Usage::
+
+        merger = OFTKarcherMerging(lam=1.0, device="cuda")
+        optimizer = _AlphaOptimizerAdaMerging(merger, n_iters=500, lr=1e-2, device="cuda")
+        merged = optimizer.optimize(adapter_paths, model, task_loaders, task_names)
+    """
+
+    def __init__(
+        self,
+        merger: RiemannianMerging,
+        n_iters: int = 100,
+        lr: float = 1e-3,
+        max_batch_size: int = 64,
+        init_alpha: float = 1,  # 1 is equal_alphas
+        equal_alphas: bool = False,
+        log_wandb: bool = True,
+        device: str = "cpu",
+    ) -> None:
+        self.merger = merger
+        self.n_iters = n_iters
+        self.lr = lr
+        self.max_batch_size = max_batch_size
+        self.init_alpha = init_alpha
+        self.equal_alphas = equal_alphas
+        self.log_wandb = log_wandb
+        self.device = device
+        self.use_pp = False
+        self.ties_trim_ratio = 0.2
+
+    @staticmethod
+    def _entropy(logits: Tensor, mask: Tensor) -> Tensor:
+        p = logits.softmax(-1)
+        h = -(p * p.clamp(min=1e-8).log()).sum(-1)
+        return (h * mask.float()).sum() / mask.float().sum().clamp(min=1.0)
+
+    @staticmethod
+    def _ties(vecs: List[Tensor], trim_ratio: float) -> List[Tensor]:
+        """AdaMerging++ TIES: trim, elect sign, disjoint merge mask."""
+        T, shape = len(vecs), vecs[0].shape
+        flat = torch.stack(vecs).float().view(T, -1)
+        D = flat.shape[1]
+        k = max(1, int(trim_ratio * D))
+        thresh = flat.abs().kthvalue(D - k + 1, dim=1, keepdim=True).values
+        trimmed = flat * (flat.abs() >= thresh)
+        elected = torch.where(
+            (trimmed * (trimmed > 0)).sum(0) >= (trimmed.abs() * (trimmed < 0)).sum(0),
+            torch.ones(D, device=flat.device), -torch.ones(D, device=flat.device),
+        )
+        mask = (trimmed.sign() == elected.unsqueeze(0)) | (trimmed == 0)
+        phi = trimmed * mask
+        return [phi[t].view(shape) for t in range(T)]
+
+    def optimize_from_vecs(
+        self,
+        task_vecs: Dict[str, List[Tensor]],
+        base: Dict[str, Tensor],
+        key_map: Dict[str, str],
+        keys: List[str],
+        ref_w: Dict[str, Tensor],
+        model,
+        task_loaders: List,
+        task_names: List[str],
+        mode: MergeMode = "standard",
+        fisher_list: Optional[Dict[str, List[Tensor]]] = None,
+    ) -> Dict[str, Tensor]:
+        """Entropy loop given pre-built task vectors and base weights.
+
+        Useful when a caller (e.g. AdaMergingPP) needs to preprocess task vectors
+        (e.g. TIES) before optimization.  `ref_w` is the first adapter's state-dict,
+        used only to recover the original dtype for the final cast.
+        """
+        T = len(task_names)
+        L = len(keys)
+
+        alpha_shape = (1, 1) if self.equal_alphas else (T, L)
+        alphas = torch.full(
+            alpha_shape,
+            float(self.init_alpha),
+            device=self.device,
+            dtype=torch.float32,
+            requires_grad=True,
+        )
+        opt = torch.optim.Adam([alphas], lr=self.lr, betas=(0.9, 0.999))
+
+        cyc = [cycle(dl) for dl in task_loaders]
+        model.eval()
+        for p in model.parameters():
+            p.requires_grad_(False)
+
+        for step in tqdm(range(self.n_iters), desc=f"AlphaOptimizer({type(self.merger).__name__})"):
+            opt.zero_grad()
+            ents: List[Tensor] = []
+
+            clamped_alphas = torch.clamp(alphas, 0.0, 1.0).expand(T, L)
+
+            merged_params = {
+                key_map[k]: base[k] + self.merger.merge_formula(
+                    task_vecs[k],
+                    fisher_list[k] if fisher_list else None,
+                    mode,
+                    alphas=clamped_alphas[:, i],
+                )
+                for i, k in enumerate(keys)
+            }
+
+            ce_vals: List[float] = []
+            for t in range(T):
+                batch = next(cyc[t])
+                ids = batch["input_ids"][:self.max_batch_size].to(self.device)
+                attn = batch["attention_mask"][:self.max_batch_size].to(self.device)
+                labels = batch["labels"][:self.max_batch_size].to(self.device)
+
+                out = functional_call(
+                    model, merged_params, (),
+                    {"input_ids": ids, "attention_mask": attn},
+                )
+                logits = out.logits.float()
+                assert logits.dim() == 3
+                ents.append(self._entropy(logits, attn))
+
+                with torch.no_grad():
+                    ce_out = functional_call(
+                        model, merged_params, (),
+                        {"input_ids": ids, "attention_mask": attn, "labels": labels},
+                    )
+                    ce_vals.append(ce_out.loss.item())
+
+            loss: Tensor = sum(ents)  # type: ignore[assignment]
+            loss.backward()
+            opt.step()
+
+            if self.log_wandb:
+                log = {"entropy/total": loss.item(), "ce/total": sum(ce_vals) / len(ce_vals)}
+                for t, name in enumerate(task_names):
+                    log[f"entropy/{name}"] = ents[t].item()
+                    log[f"ce/{name}"] = ce_vals[t]
+                    log[f"alpha_mean/{name}"] = clamped_alphas[t].mean().item()
+                wandb.log(log, step=step)  # type: ignore[attr-defined]
+
+            del merged_params, ents, loss, ce_vals
+            torch.cuda.empty_cache()
+
+        with torch.no_grad():
+            final_alphas = alphas.clamp(0.0, 1.0).expand(T, L)
+            merged: Dict[str, Tensor] = {}
+            for i, k in enumerate(keys):
+                delta = self.merger.merge_formula(
+                    task_vecs[k],
+                    fisher_list[k] if fisher_list else None,
+                    mode,
+                    alphas=final_alphas[:, i],
+                )
+                merged[k] = (base[k] + delta).to(ref_w[k].dtype)
+
+        if self.log_wandb:
+            fig, ax = plt.subplots(figsize=(max(6, L // 4), max(3, T)))
+            ax.imshow(final_alphas.detach().cpu().numpy(), aspect="auto", cmap="Blues")
+            ax.set_yticks(range(T)); ax.set_yticklabels(task_names)
+            ax.set_xlabel("Layer"); ax.set_ylabel("Task")
+            plt.colorbar(ax.images[0], ax=ax); plt.tight_layout()
+            wandb.log({"alpha/heatmap": wandb.Image(fig)})  # type: ignore[attr-defined]
+            plt.close(fig)
+
+        return merged
+
+    def optimize(
+        self,
+        adapter_paths: List[str],
+        model,
+        task_loaders: List,
+        task_names: List[str],
+        fisher_paths: Optional[List[str]] = None,
+        mode: MergeMode = "standard",
+    ) -> Dict[str, Tensor]:
+        T = len(adapter_paths)
+        assert T == len(task_loaders) == len(task_names)
+
+        all_w = self.merger.load_weights(adapter_paths)
+        oft_keys = sorted(k for k in all_w[0]
+                          if "oft_r" in k or ("oft_" in k.lower() and "classifier" not in k.lower()))
+        assert oft_keys, "No OFT keys found"
+
+        params = dict(model.named_parameters())
+        key_map = {}
+        for k in oft_keys:
+            for c in [k, k.replace(".weight", ".default.weight")]:
+                if c in params:
+                    key_map[k] = c
+                    break
+        keys = [k for k in oft_keys if k in key_map]
+        assert keys, "No adapter keys mapped to model parameters"
+
+        task_vecs = {}
+        for k in keys:
+            vecs = [all_w[t][k].float().to(self.device) for t in range(T)]
+            task_vecs[k] = self._ties(vecs, self.ties_trim_ratio) if self.use_pp else vecs
+        base = {k: params[key_map[k]].data.clone().float().to(self.device) for k in keys}
+
+        fisher_list: Optional[Dict[str, List[Tensor]]] = None
+        if fisher_paths is not None:
+            all_f = self.merger.load_fishers(fisher_paths)
+            fisher_list = {k: [all_f[t][k].float().to(self.device) for t in range(T)] for k in keys}
+
+        return self.optimize_from_vecs(
+            task_vecs, base, key_map, keys, all_w[0], model, task_loaders, task_names,
+            mode=mode, fisher_list=fisher_list,
+        )
