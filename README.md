@@ -4,7 +4,7 @@ Code for the paper *Fisher-Weighted Riemannian Model Merging for Orthogonal Fine
 Experiments use *Llama 3.1 8B* and *Qwen 2.5 3B* on twelve generative tasks, with an
 *SDXL* study in the appendix.
 
-Released finetunes: https://anonymous-hf.com/a/rzhmxiutrwjg/
+Released finetunes: [https://anonymous-hf.com/a/rzhmxiutrwjg/](https://huggingface.co/eduardo-terres2/OFT-Llama-Qwen-Finetunes)
 
 Run every command from the repository root. The SLURM scripts target `gpu_a100` /
 `gpu_h100` partitions; adjust their `#SBATCH` headers for your cluster.
